@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=MigraCoder
+Comment=Move workspaces without losing Codex sessions
+Exec=migracoder-gui
+Icon=io.github.migracoder.MigraCoder
+Terminal=false
+Categories=Development;
+Keywords=Codex;Migration;Repository;Workspace;
