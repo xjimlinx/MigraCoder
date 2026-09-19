@@ -13,8 +13,10 @@ INSTALL_BIN := $(DESTDIR)$(PREFIX)/bin/migracoder
 INSTALL_GUI_BIN := $(DESTDIR)$(PREFIX)/bin/migracoder-gui
 DESKTOP_FILE := assets/io.github.migracoder.MigraCoder.desktop
 ICON_FILE := assets/io.github.migracoder.MigraCoder.svg
+ICON_PNG := assets/io.github.migracoder.MigraCoder.png
 INSTALL_DESKTOP_FILE := $(DESTDIR)$(PREFIX)/share/applications/io.github.migracoder.MigraCoder.desktop
 INSTALL_ICON_FILE := $(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps/io.github.migracoder.MigraCoder.svg
+INSTALL_ICON_PNG := $(DESTDIR)$(PREFIX)/share/icons/hicolor/256x256/apps/io.github.migracoder.MigraCoder.png
 
 .PHONY: all build release test lint check completions install install-cli install-completions \
 	install-fish install-bash install-zsh gui run-gui install-gui install-all uninstall clean help
@@ -77,6 +79,12 @@ install-gui: release
 	install -Dm644 $(DESKTOP_FILE) $(INSTALL_DESKTOP_FILE)
 	sed -i 's|^Exec=.*|Exec=$(BINDIR)/migracoder-gui|' $(INSTALL_DESKTOP_FILE)
 	install -Dm644 $(ICON_FILE) $(INSTALL_ICON_FILE)
+	install -Dm644 $(ICON_PNG) $(INSTALL_ICON_PNG)
+	-command -v gtk-update-icon-cache >/dev/null 2>&1 && \
+		gtk-update-icon-cache -f -t $(DESTDIR)$(PREFIX)/share/icons/hicolor
+	-command -v update-desktop-database >/dev/null 2>&1 && \
+		update-desktop-database $(DESTDIR)$(PREFIX)/share/applications
+	-command -v kbuildsycoca6 >/dev/null 2>&1 && kbuildsycoca6
 	@printf 'installed: %s\n' '$(INSTALL_GUI_BIN)'
 	@printf 'desktop entry: %s\n' '$(INSTALL_DESKTOP_FILE)'
 
@@ -103,6 +111,7 @@ uninstall:
 	$(RM) $(INSTALL_GUI_BIN)
 	$(RM) $(INSTALL_DESKTOP_FILE)
 	$(RM) $(INSTALL_ICON_FILE)
+	$(RM) $(INSTALL_ICON_PNG)
 	$(RM) $(DESTDIR)$(HOME)/.config/fish/completions/migracoder.fish
 	$(RM) $(DESTDIR)$(PREFIX)/share/bash-completion/completions/migracoder
 	$(RM) $(DESTDIR)$(PREFIX)/share/zsh/site-functions/_migracoder

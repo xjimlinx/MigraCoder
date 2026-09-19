@@ -67,10 +67,17 @@ struct RenameInput {
 }
 
 pub fn run() -> Result<()> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_app_id("io.github.migracoder.MigraCoder")
+        .with_inner_size([920.0, 700.0])
+        .with_min_inner_size([720.0, 520.0]);
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!(
+        "../assets/io.github.migracoder.MigraCoder.png"
+    )) {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([920.0, 700.0])
-            .with_min_inner_size([720.0, 520.0]),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
@@ -1025,42 +1032,105 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+struct CjkFont {
+    path: PathBuf,
+    index: u32,
+    data: Vec<u8>,
+}
+
 fn configure_fonts(context: &egui::Context) {
-    let mut candidates = vec![
-        PathBuf::from("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"),
-        PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
-        PathBuf::from("/usr/share/fonts/WindowsFonts/msyh.ttc"),
-    ];
-    if let Ok(output) = Command::new("fc-match")
-        .args(["-f", "%{file}", "sans-serif:lang=zh-cn"])
-        .output()
-        && output.status.success()
-    {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        if !path.is_empty() {
-            candidates.insert(0, PathBuf::from(path));
-        }
-    }
-    let Some((path, data)) = candidates
-        .into_iter()
-        .find_map(|path| fs::read(&path).ok().map(|data| (path, data)))
-    else {
+    let Some(font) = load_cjk_font() else {
         return;
     };
+    let name = format!("cjk:{}", font.path.display());
+    let mut data = egui::FontData::from_owned(font.data);
+    data.index = font.index;
     let mut fonts = egui::FontDefinitions::default();
-    let name = format!("cjk:{}", path.display());
-    fonts
-        .font_data
-        .insert(name.clone(), egui::FontData::from_owned(data).into());
-    fonts
-        .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default()
-        .insert(0, name.clone());
-    fonts
-        .families
-        .entry(egui::FontFamily::Monospace)
-        .or_default()
-        .push(name);
+    fonts.font_data.insert(name.clone(), data.into());
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts.families.entry(family).or_default().push(name.clone());
+    }
     context.set_fonts(fonts);
+}
+
+fn load_cjk_font() -> Option<CjkFont> {
+    cjk_font_candidates().into_iter().find_map(|(path, index)| {
+        fs::read(&path)
+            .ok()
+            .map(|data| CjkFont { path, index, data })
+    })
+}
+
+fn cjk_font_candidates() -> Vec<(PathBuf, u32)> {
+    let mut candidates = Vec::new();
+    for query in [
+        "Noto Sans CJK SC:charset=4e00",
+        "Noto Sans SC:charset=4e00",
+        "Source Han Sans CN:charset=4e00",
+        "Source Han Sans SC:charset=4e00",
+        "WenQuanYi Micro Hei:charset=4e00",
+        "WenQuanYi Zen Hei:charset=4e00",
+        "Microsoft YaHei:charset=4e00",
+        "PingFang SC:charset=4e00",
+        "sans-serif:charset=4e00",
+    ] {
+        if let Some(candidate) = fc_match(query) {
+            candidates.push(candidate);
+        }
+    }
+    candidates.extend([
+        (
+            PathBuf::from("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc"),
+            2,
+        ),
+        (
+            PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+            2,
+        ),
+        (
+            PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf"),
+            0,
+        ),
+        (
+            PathBuf::from("/usr/share/fonts/adobe-source-han-sans/SourceHanSansCN-Regular.otf"),
+            0,
+        ),
+        (
+            PathBuf::from("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"),
+            0,
+        ),
+        (
+            PathBuf::from("/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc"),
+            0,
+        ),
+        (PathBuf::from("/usr/share/fonts/WindowsFonts/msyh.ttc"), 0),
+        (PathBuf::from("/System/Library/Fonts/PingFang.ttc"), 0),
+        (PathBuf::from("/System/Library/Fonts/STHeiti Light.ttc"), 0),
+        (PathBuf::from("/Library/Fonts/Arial Unicode.ttf"), 0),
+        (PathBuf::from("C:/Windows/Fonts/msyh.ttc"), 0),
+        (PathBuf::from("C:/Windows/Fonts/simhei.ttf"), 0),
+    ]);
+    candidates
+}
+
+fn fc_match(query: &str) -> Option<(PathBuf, u32)> {
+    let output = Command::new("fc-match")
+        .args(["-f", "%{file}\n%{index}", query])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    let path = lines.next()?.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let index = lines
+        .next()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|index| *index < 0x1_0000)
+        .unwrap_or(0);
+    Some((PathBuf::from(path), index))
 }
