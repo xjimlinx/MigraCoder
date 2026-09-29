@@ -11,7 +11,20 @@
 - `.codex-global-state.json` 中的工作区、权限和项目路径；
 - `config.toml` 中按路径保存的项目配置（例如 `trust_level`）。
 
-历史对话、提示词和工具命令正文不会被替换。
+同时也支持 opencode 的本地会话数据，默认自动检测 `~/.local/share/opencode`（或
+`$XDG_DATA_HOME/opencode`），更新其 `opencode.db` 中的：
+
+- `project` 的工作目录和 sandbox 路径；
+- `project_directory` 的项目目录映射；
+- `session` 的工作目录和相对路径；
+- `workspace` 的目录；
+- 事件日志（`event`）中会话创建/更新事件的工作目录与相对路径。
+
+opencode 的项目标识保存在仓库的 `.git/opencode` 中并随目录一起移动，因此移动后会话
+仍然归属同一项目。历史对话、提示词和工具命令正文不会被替换（包括事件日志中的标题等
+正文内容）。
+
+> 迁移前请关闭 opencode，避免它与本工具同时写入 `opencode.db`。
 
 ## 图形界面
 
@@ -24,10 +37,10 @@ make gui
 
 界面提供两种流程：
 
-- **单个会话**：默认浏览全部工作区，可按标题、路径、会话 ID 或正文搜索；会话以固定表头的表格展示话题标题、工作目录、更新时间、状态和操作。单击一行选择，双击标题或按“查看”打开摘要窗口，点选后会自动带入源路径。
+- **单个会话**：顶部可在 **Codex** / **opencode** 两个标签间切换，分别浏览各自的会话。默认浏览全部工作区，可按标题、路径、会话 ID 或正文（opencode 为 slug）搜索；会话以固定表头的表格展示话题标题、工作目录、更新时间、状态和操作。单击一行选择，双击标题或按“查看”打开摘要窗口，点选后会自动带入源路径。opencode 标签的会话可查看内容、复制 `opencode --session` 命令，并可单独修复该会话的指向。
 - **整个工作区**：选择源目录和目标位置，可选择移动磁盘目录，或只修复 Codex 指向。
 
-扫描和迁移在后台执行；“检查并执行”会先生成真实变更计划，再显示确认窗口。每次真实修改仍会创建一致性备份，完成后会自动复查旧路径指向。
+扫描和迁移在后台执行；“检查并执行”会先生成真实变更计划，再显示确认窗口。每次真实修改仍会创建一致性备份，完成后会自动复查旧路径指向。界面可勾选是否同时处理 opencode 会话，并填写其数据目录。
 
 会话详情按需读取，最多展示首条、搜索命中和最近的用户消息摘要；还可以修改话题标题、复制会话 ID 或对应的 `codex resume` 命令，不会在主列表展开整段提示词。标题修改会同步写入 Codex 会话索引、状态数据库和桌面端标题缓存，并在修改前备份。
 
@@ -188,6 +201,13 @@ migracoder verify /旧路径/repo /新路径/repo
 
 ```bash
 migracoder --codex-home /path/to/codex-home repoint /old/repo /new/repo
+```
+
+自定义 opencode 数据目录，或只处理 Codex：
+
+```bash
+migracoder --opencode-home /path/to/opencode repoint /old/repo /new/repo
+migracoder --no-opencode repoint /old/repo /new/repo
 ```
 
 ## Shell 自动补全

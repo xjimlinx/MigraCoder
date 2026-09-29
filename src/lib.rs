@@ -158,6 +158,8 @@ pub struct SessionPreview {
 #[derive(Debug)]
 pub struct DoctorReport {
     pub codex_home: PathBuf,
+    pub opencode_home: Option<PathBuf>,
+    pub opencode_sessions: usize,
     pub sessions: usize,
     pub workspaces: usize,
     pub databases: usize,
@@ -174,13 +176,23 @@ impl DoctorReport {
 #[derive(Debug)]
 pub struct Migrator {
     pub codex_home: PathBuf,
+    pub opencode_home: Option<PathBuf>,
 }
 
 impl Migrator {
     pub fn new(codex_home: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
             codex_home: normalize_path(codex_home)?,
+            opencode_home: None,
         })
+    }
+
+    pub fn with_opencode(mut self, opencode_home: Option<PathBuf>) -> Result<Self> {
+        self.opencode_home = match opencode_home {
+            Some(path) => Some(normalize_path(path)?),
+            None => None,
+        };
+        Ok(self)
     }
 
     pub fn plan(&self, old: impl AsRef<Path>, new: impl AsRef<Path>) -> Result<Plan> {
@@ -194,6 +206,7 @@ impl Migrator {
         self.plan_global_state(&mut plan)?;
         self.plan_sessions(&mut plan)?;
         self.plan_databases(&mut plan)?;
+        self.plan_opencode(&mut plan)?;
         Ok(plan)
     }
 
@@ -238,6 +251,267 @@ impl Migrator {
         Ok(matches)
     }
 
+    pub fn list_opencode_sessions(&self, search: Option<&str>) -> Result<Vec<SessionInfo>> {
+        self.collect_opencode_sessions(None, false, search)
+    }
+
+    pub fn find_opencode_sessions(
+        &self,
+        path: impl AsRef<Path>,
+        recursive: bool,
+        search: Option<&str>,
+    ) -> Result<Vec<SessionInfo>> {
+        let target = normalize_path(path)?;
+        self.collect_opencode_sessions(Some(target), recursive, search)
+    }
+
+    fn collect_opencode_sessions(
+        &self,
+        target: Option<PathBuf>,
+        recursive: bool,
+        search: Option<&str>,
+    ) -> Result<Vec<SessionInfo>> {
+        let Some(path) = self.opencode_database() else {
+            return Ok(Vec::new());
+        };
+        let connection = open_read_only(&path)?;
+        if !table_names(&connection)?.contains("session") {
+            return Ok(Vec::new());
+        }
+        let needle = search.map(str::to_lowercase);
+        let mut statement = connection.prepare(
+            "SELECT id, directory, title, slug, time_updated, time_archived FROM session",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, Option<i64>>(5)?,
+            ))
+        })?;
+        let mut matches = Vec::new();
+        for row in rows {
+            let (id, directory, title, slug, updated, archived) = row?;
+            if let Some(target) = &target {
+                let cwd = Path::new(&directory);
+                let path_matches =
+                    cwd == target || (recursive && cwd.starts_with(target) && cwd != target);
+                if !path_matches {
+                    continue;
+                }
+            }
+            let mut title = title.unwrap_or_default();
+            if title.is_empty() {
+                title = slug.clone().unwrap_or_else(|| id.clone());
+            }
+            let mut match_excerpt = String::new();
+            if let Some(needle) = &needle {
+                let Some(excerpt) =
+                    opencode_session_excerpt(&id, &title, &directory, slug.as_deref(), needle)
+                else {
+                    continue;
+                };
+                match_excerpt = excerpt;
+            }
+            matches.push(SessionInfo {
+                session_id: id,
+                cwd: PathBuf::from(directory),
+                title,
+                rollout_path: None,
+                updated_at_ms: updated.unwrap_or(0),
+                archived: archived.is_some(),
+                match_excerpt,
+            });
+        }
+        matches.sort_by_key(|session| std::cmp::Reverse(session.updated_at_ms));
+        Ok(matches)
+    }
+
+    pub fn resolve_opencode_session(&self, reference: &str) -> Result<SessionInfo> {
+        let sessions = self.list_opencode_sessions(None)?;
+        if let Some(session) = sessions
+            .iter()
+            .find(|session| session.session_id == reference)
+        {
+            return Ok(session.clone());
+        }
+        let matches: Vec<_> = sessions
+            .into_iter()
+            .filter(|session| session.session_id.starts_with(reference))
+            .collect();
+        match matches.as_slice() {
+            [] => bail!("opencode session not found: {reference}"),
+            [session] => Ok(session.clone()),
+            many => {
+                let ids = many
+                    .iter()
+                    .take(5)
+                    .map(|session| session.session_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!("opencode session prefix is ambiguous: {reference} ({ids})")
+            }
+        }
+    }
+
+    pub fn opencode_session_preview(
+        &self,
+        reference: &str,
+        limit: usize,
+        search: Option<&str>,
+    ) -> Result<SessionPreview> {
+        let session = self.resolve_opencode_session(reference)?;
+        let Some(path) = self.opencode_database() else {
+            return Ok(SessionPreview {
+                session,
+                user_messages: Vec::new(),
+            });
+        };
+        let connection = open_read_only(&path)?;
+        let mut message_statement = connection
+            .prepare("SELECT id FROM message WHERE session_id = ?1 ORDER BY time_created, id")?;
+        let message_rows =
+            message_statement.query_map([&session.session_id], |row| row.get::<_, String>(0))?;
+        let mut user_message_ids = Vec::new();
+        let mut part_statement = connection
+            .prepare("SELECT data FROM part WHERE message_id = ?1 ORDER BY time_created, id")?;
+        for message_id in message_rows {
+            let message_id = message_id?;
+            let is_user: bool = match connection.query_row(
+                "SELECT data FROM message WHERE id = ?1",
+                [&message_id],
+                |row| row.get::<_, String>(0),
+            ) {
+                Ok(data) => {
+                    serde_json::from_str::<Value>(&data)
+                        .ok()
+                        .and_then(|value| {
+                            value.get("role").and_then(Value::as_str).map(str::to_owned)
+                        })
+                        .as_deref()
+                        == Some("user")
+                }
+                Err(_) => false,
+            };
+            if !is_user {
+                continue;
+            }
+            let mut text = String::new();
+            let parts = part_statement.query_map([&message_id], |row| row.get::<_, String>(0))?;
+            for part in parts {
+                let Ok(value) = serde_json::from_str::<Value>(&part?) else {
+                    continue;
+                };
+                if value.get("type").and_then(Value::as_str) == Some("text")
+                    && let Some(piece) = value.get("text").and_then(Value::as_str)
+                {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(piece);
+                }
+            }
+            let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            if compact.is_empty() {
+                continue;
+            }
+            if let Some(search) = search
+                && !compact.to_lowercase().contains(&search.to_lowercase())
+            {
+                continue;
+            }
+            user_message_ids.push(compact_preview_text(&compact, 600));
+            if user_message_ids.len() >= limit {
+                break;
+            }
+        }
+        Ok(SessionPreview {
+            session,
+            user_messages: user_message_ids,
+        })
+    }
+
+    pub fn plan_opencode_session(
+        &self,
+        reference: &str,
+        new: impl AsRef<Path>,
+    ) -> Result<(SessionInfo, Plan)> {
+        let new = normalize_path(new)?;
+        let session = self.resolve_opencode_session(reference)?;
+        if session.cwd == new {
+            bail!("source and destination resolve to the same path");
+        }
+        let mut plan = Plan::new(session.cwd.clone(), new);
+        self.plan_opencode_session_rows(&mut plan, &session.session_id)?;
+        Ok((session, plan))
+    }
+
+    fn plan_opencode_session_rows(&self, plan: &mut Plan, session_id: &str) -> Result<()> {
+        let Some(path) = self.opencode_database() else {
+            return Ok(());
+        };
+        let connection = open_read_only(&path)?;
+        let tables = table_names(&connection)?;
+        let mut updates = Vec::new();
+        if tables.contains("session") {
+            for (column, relative) in [("directory", false), ("path", true)] {
+                if !has_column(&connection, "session", column)? {
+                    continue;
+                }
+                let current: Option<String> = connection.query_row(
+                    &format!("SELECT \"{column}\" FROM session WHERE id = ?1"),
+                    [session_id],
+                    |row| row.get(0),
+                )?;
+                let Some(current) = current else {
+                    continue;
+                };
+                let replaced = if relative {
+                    replace_relative_path(&current, &plan.old, &plan.new, true)
+                } else {
+                    replace_path(&current, &plan.old, &plan.new, true)
+                };
+                if let Some(value) = replaced {
+                    updates.push(RowUpdate {
+                        table: "session",
+                        column,
+                        identity_column: "id",
+                        identity: SqlValue::Text(session_id.to_owned()),
+                        value,
+                    });
+                }
+            }
+        }
+        if tables.contains("event") && has_column(&connection, "event", "data")? {
+            let mut statement = connection.prepare(
+                "SELECT id, data FROM event \
+                 WHERE aggregate_id = ?1 AND type LIKE 'session.%'",
+            )?;
+            let rows = statement.query_map([session_id], |row| {
+                Ok((row.get::<_, SqlValue>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, current) = row?;
+                if let Some(value) = replace_opencode_event_paths(&current, &plan.old, &plan.new) {
+                    updates.push(RowUpdate {
+                        table: "event",
+                        column: "data",
+                        identity_column: "id",
+                        identity: id,
+                        value,
+                    });
+                }
+            }
+        }
+        if !updates.is_empty() {
+            plan.database_changes.push(DatabaseChange { path, updates });
+        }
+        Ok(())
+    }
+
     pub fn doctor(&self) -> Result<DoctorReport> {
         let mut warnings = Vec::new();
         if !self.codex_home.is_dir() {
@@ -247,6 +521,8 @@ impl Migrator {
             ));
             return Ok(DoctorReport {
                 codex_home: self.codex_home.clone(),
+                opencode_home: self.opencode_home.clone(),
+                opencode_sessions: 0,
                 sessions: 0,
                 workspaces: 0,
                 databases: 0,
@@ -277,8 +553,17 @@ impl Migrator {
         if databases == 0 {
             warnings.push("没有发现 Codex 状态数据库，将只检查文本数据".to_owned());
         }
+        let mut opencode_sessions = 0;
+        if let Some(opencode_home) = &self.opencode_home {
+            match opencode_session_count(opencode_home) {
+                Ok(count) => opencode_sessions = count,
+                Err(error) => warnings.push(format!("opencode 数据无法读取：{error:#}")),
+            }
+        }
         Ok(DoctorReport {
             codex_home: self.codex_home.clone(),
+            opencode_home: self.opencode_home.clone(),
+            opencode_sessions,
             sessions: sessions.len(),
             workspaces,
             databases,
@@ -731,6 +1016,162 @@ impl Migrator {
         Ok(())
     }
 
+    fn opencode_database(&self) -> Option<PathBuf> {
+        let home = self.opencode_home.as_ref()?;
+        let path = home.join("opencode.db");
+        path.is_file().then_some(path)
+    }
+
+    fn plan_opencode(&self, plan: &mut Plan) -> Result<()> {
+        let Some(path) = self.opencode_database() else {
+            return Ok(());
+        };
+        let connection = open_read_only(&path)?;
+        let tables = table_names(&connection)?;
+        let mut updates = Vec::new();
+
+        for (table, identity, column) in [
+            ("project", "id", "worktree"),
+            ("project_directory", "rowid", "directory"),
+            ("workspace", "id", "directory"),
+        ] {
+            if !tables.contains(table) || !has_column(&connection, table, column)? {
+                continue;
+            }
+            let query = format!(
+                "SELECT {identity}, \"{column}\" FROM \"{table}\" \
+                 WHERE \"{column}\" IS NOT NULL AND \"{column}\" <> ''"
+            );
+            let mut statement = connection.prepare(&query)?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, SqlValue>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, current) = row?;
+                if let Some(value) = replace_path(&current, &plan.old, &plan.new, false) {
+                    updates.push(RowUpdate {
+                        table,
+                        column,
+                        identity_column: identity,
+                        identity: id,
+                        value,
+                    });
+                }
+            }
+        }
+
+        if tables.contains("project") && has_column(&connection, "project", "sandboxes")? {
+            let mut statement = connection.prepare(
+                "SELECT id, sandboxes FROM project WHERE sandboxes IS NOT NULL AND sandboxes <> ''",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((row.get::<_, SqlValue>(0)?, row.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, current) = row?;
+                if let Some(value) = replace_json_paths(&current, &plan.old, &plan.new, false) {
+                    updates.push(RowUpdate {
+                        table: "project",
+                        column: "sandboxes",
+                        identity_column: "id",
+                        identity: id,
+                        value,
+                    });
+                }
+            }
+        }
+
+        let mut changed_sessions = Vec::new();
+        if tables.contains("session") {
+            let has_directory = has_column(&connection, "session", "directory")?;
+            let has_path = has_column(&connection, "session", "path")?;
+            if has_directory || has_path {
+                let directory_column = if has_directory {
+                    "\"directory\""
+                } else {
+                    "NULL"
+                };
+                let path_column = if has_path { "\"path\"" } else { "NULL" };
+                let mut statement = connection.prepare(&format!(
+                    "SELECT id, {directory_column}, {path_column} FROM session"
+                ))?;
+                let rows = statement.query_map([], |row| {
+                    Ok((
+                        row.get::<_, SqlValue>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (id, directory, path) = row?;
+                    let mut changed = false;
+                    if let Some(current) = directory
+                        && let Some(value) = replace_path(&current, &plan.old, &plan.new, false)
+                    {
+                        updates.push(RowUpdate {
+                            table: "session",
+                            column: "directory",
+                            identity_column: "id",
+                            identity: id.clone(),
+                            value,
+                        });
+                        changed = true;
+                    }
+                    if let Some(current) = path
+                        && let Some(value) =
+                            replace_relative_path(&current, &plan.old, &plan.new, false)
+                    {
+                        updates.push(RowUpdate {
+                            table: "session",
+                            column: "path",
+                            identity_column: "id",
+                            identity: id.clone(),
+                            value,
+                        });
+                        changed = true;
+                    }
+                    if changed && let SqlValue::Text(session_id) = &id {
+                        changed_sessions.push(session_id.clone());
+                    }
+                }
+            }
+        }
+
+        if tables.contains("event")
+            && has_column(&connection, "event", "data")?
+            && has_column(&connection, "event", "aggregate_id")?
+        {
+            let mut statement = connection.prepare(
+                "SELECT id, data FROM event \
+                 WHERE aggregate_id = ?1 AND type LIKE 'session.%'",
+            )?;
+            for session_id in &changed_sessions {
+                let rows = statement.query_map([session_id], |row| {
+                    Ok((row.get::<_, SqlValue>(0)?, row.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (id, current) = row?;
+                    if let Some(value) =
+                        replace_opencode_event_paths(&current, &plan.old, &plan.new)
+                    {
+                        updates.push(RowUpdate {
+                            table: "event",
+                            column: "data",
+                            identity_column: "id",
+                            identity: id,
+                            value,
+                        });
+                    }
+                }
+            }
+        }
+
+        if !updates.is_empty() {
+            plan.database_changes.push(DatabaseChange { path, updates });
+        }
+        Ok(())
+    }
+
     fn plan_session_databases(&self, plan: &mut Plan, thread_id: &str) -> Result<()> {
         for path in self.all_databases()? {
             let connection = open_read_only(&path)?;
@@ -1060,6 +1501,21 @@ impl Migrator {
         )
     }
 
+    fn backup_relative(&self, path: &Path) -> Result<PathBuf> {
+        if let Ok(relative) = path.strip_prefix(&self.codex_home) {
+            return Ok(PathBuf::from("codex").join(relative));
+        }
+        if let Some(opencode_home) = &self.opencode_home
+            && let Ok(relative) = path.strip_prefix(opencode_home)
+        {
+            return Ok(PathBuf::from("opencode").join(relative));
+        }
+        bail!(
+            "cannot back up {}: not under a known data directory",
+            path.display()
+        )
+    }
+
     fn create_backup_for_changes(
         &self,
         text_changes: &[TextChange],
@@ -1071,22 +1527,22 @@ impl Migrator {
         fs::create_dir_all(&backup_dir)?;
         let mut files = Vec::new();
         for change in text_changes {
-            let relative = change.path.strip_prefix(&self.codex_home)?;
-            let destination = backup_dir.join(relative);
+            let relative = self.backup_relative(&change.path)?;
+            let destination = backup_dir.join(&relative);
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent)?;
             }
             fs::copy(&change.path, &destination)?;
-            files.push(json!({"path": relative, "kind": "file"}));
+            files.push(json!({"path": relative, "source": change.path, "kind": "file"}));
         }
         for change in database_changes {
-            let relative = change.path.strip_prefix(&self.codex_home)?;
-            let destination = backup_dir.join(relative);
+            let relative = self.backup_relative(&change.path)?;
+            let destination = backup_dir.join(&relative);
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent)?;
             }
             backup_database(&change.path, &destination)?;
-            files.push(json!({"path": relative, "kind": "sqlite"}));
+            files.push(json!({"path": relative, "source": change.path, "kind": "sqlite"}));
         }
         let fields = manifest
             .as_object_mut()
@@ -1107,13 +1563,18 @@ impl Migrator {
         #[derive(Deserialize)]
         struct ManifestFile {
             path: PathBuf,
+            #[serde(default)]
+            source: Option<PathBuf>,
             kind: String,
         }
         let manifest: Manifest =
             serde_json::from_slice(&fs::read(backup_dir.join("manifest.json"))?)?;
         for item in manifest.files {
             let source = backup_dir.join(&item.path);
-            let destination = self.codex_home.join(&item.path);
+            let destination = item
+                .source
+                .clone()
+                .unwrap_or_else(|| self.codex_home.join(&item.path));
             if item.kind == "sqlite" {
                 restore_database(&source, &destination)?;
             } else {
@@ -1175,6 +1636,84 @@ fn replace_path(value: &str, old: &Path, new: &Path, exact: bool) -> Option<Stri
         if let Some(suffix) = value.strip_prefix(&(file_old + "/")) {
             return Some(format!("file://{new}/{suffix}"));
         }
+    }
+    None
+}
+
+fn replace_relative_path(value: &str, old: &Path, new: &Path, exact: bool) -> Option<String> {
+    let old = path_string(old);
+    let new = path_string(new);
+    let old = old.trim_start_matches('/');
+    let new = new.trim_start_matches('/');
+    if !old.is_empty() && value == old {
+        return Some(new.to_owned());
+    }
+    if !exact
+        && !old.is_empty()
+        && let Some(suffix) = value.strip_prefix(&format!("{old}/"))
+    {
+        return Some(format!("{new}/{suffix}"));
+    }
+    None
+}
+
+fn replace_opencode_event_paths(text: &str, old: &Path, new: &Path) -> Option<String> {
+    let mut value: Value = serde_json::from_str(text).ok()?;
+    let mut changes = 0;
+    if let Some(info) = value.get_mut("info").and_then(Value::as_object_mut) {
+        if let Some(current) = info
+            .get("directory")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            && let Some(replaced) = replace_path(&current, old, new, false)
+        {
+            info.insert("directory".to_owned(), Value::String(replaced));
+            changes += 1;
+        }
+        if let Some(current) = info.get("path").and_then(Value::as_str).map(str::to_owned)
+            && let Some(replaced) = replace_relative_path(&current, old, new, false)
+        {
+            info.insert("path".to_owned(), Value::String(replaced));
+            changes += 1;
+        }
+    }
+    (changes > 0)
+        .then(|| serde_json::to_string(&value).expect("serializing JSON value cannot fail"))
+}
+
+fn opencode_session_count(home: &Path) -> Result<usize> {
+    let path = home.join("opencode.db");
+    if !path.is_file() {
+        bail!("找不到 opencode 数据库：{}", path.display());
+    }
+    let connection = open_read_only(&path)?;
+    if !table_names(&connection)?.contains("session") {
+        return Ok(0);
+    }
+    let count: i64 = connection.query_row("SELECT COUNT(*) FROM session", [], |row| row.get(0))?;
+    Ok(count.max(0) as usize)
+}
+
+fn opencode_session_excerpt(
+    id: &str,
+    title: &str,
+    directory: &str,
+    slug: Option<&str>,
+    needle: &str,
+) -> Option<String> {
+    if title.to_lowercase().contains(needle) {
+        return Some(title.to_owned());
+    }
+    if id.to_lowercase().contains(needle) {
+        return Some(format!("会话 ID：{id}"));
+    }
+    if directory.to_lowercase().contains(needle) {
+        return Some(format!("工作目录：{directory}"));
+    }
+    if let Some(slug) = slug
+        && slug.to_lowercase().contains(needle)
+    {
+        return Some(format!("slug：{slug}"));
     }
     None
 }
@@ -1444,6 +1983,7 @@ fn has_column(connection: &Connection, table: &str, column: &str) -> Result<bool
 
 fn apply_database(change: &DatabaseChange) -> Result<()> {
     let mut connection = Connection::open(&change.path)?;
+    connection.busy_timeout(std::time::Duration::from_secs(10))?;
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for update in &change.updates {
@@ -1807,6 +2347,213 @@ mod tests {
             })?;
         assert!(cwds.contains("/example/new-repo"));
         assert_eq!(source_cwd, "/example/new-repo");
+        Ok(())
+    }
+
+    fn create_opencode_fixture(opencode_home: &Path) -> Result<()> {
+        fs::create_dir_all(opencode_home)?;
+        let database = Connection::open(opencode_home.join("opencode.db"))?;
+        database.execute_batch(
+            "CREATE TABLE project (id TEXT, worktree TEXT, sandboxes TEXT);
+             CREATE TABLE project_directory (project_id TEXT, directory TEXT, type TEXT);
+             CREATE TABLE session (id TEXT, project_id TEXT, directory TEXT, path TEXT, title TEXT, slug TEXT, time_updated INTEGER, time_archived INTEGER);
+             CREATE TABLE workspace (id TEXT, directory TEXT);
+             CREATE TABLE event (id TEXT, aggregate_id TEXT, type TEXT, data TEXT);
+             CREATE TABLE message (id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+             CREATE TABLE part (id TEXT, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);",
+        )?;
+        database.execute(
+            "INSERT INTO project VALUES ('p1', '/example/old-repo', '[\"/example/old-repo\"]')",
+            [],
+        )?;
+        database.execute(
+            "INSERT INTO project_directory VALUES ('p1', '/example/old-repo', 'main')",
+            [],
+        )?;
+        database.execute(
+            "INSERT INTO session VALUES ('s1', 'p1', '/example/old-repo/sub', 'example/old-repo/sub', 'Sample session', 'sample-session', 2000, NULL)",
+            [],
+        )?;
+        database.execute(
+            "INSERT INTO session VALUES ('s2', 'p1', '/example/old-repo', 'example/old-repo', 'Main session', 'main-session', 1000, NULL)",
+            [],
+        )?;
+        database.execute(
+            "INSERT INTO workspace VALUES ('w1', '/example/old-repo')",
+            [],
+        )?;
+        database.execute(
+            "INSERT INTO event VALUES ('e1', 's1', 'session.created.1', ?1)",
+            params![
+                r#"{"sessionID":"s1","info":{"id":"s1","directory":"/example/old-repo","path":"example/old-repo","title":"/example/old-repo"}}"#
+            ],
+        )?;
+        database.execute(
+            "INSERT INTO event VALUES ('e2', 's1', 'message.updated.1', ?1)",
+            params![r#"{"sessionID":"s1","info":{"directory":"/example/old-repo"}}"#],
+        )?;
+        database.execute(
+            "INSERT INTO event VALUES ('e3', 's2', 'session.created.1', ?1)",
+            params![
+                r#"{"sessionID":"s2","info":{"id":"s2","directory":"/example/old-repo","path":"example/old-repo","title":"Main session"}}"#
+            ],
+        )?;
+        database.execute(
+            "INSERT INTO message VALUES ('m1', 's1', 1, '{\"role\":\"user\"}')",
+            [],
+        )?;
+        database.execute(
+            r#"INSERT INTO message VALUES ('m2', 's1', 2, '{"role":"assistant"}')"#,
+            [],
+        )?;
+        database.execute(
+            r#"INSERT INTO part VALUES ('p1', 'm1', 's1', 1, '{"type":"text","text":"please repoint the sample repo"}')"#,
+            [],
+        )?;
+        database.execute(
+            r#"INSERT INTO part VALUES ('p2', 'm2', 's1', 2, '{"type":"text","text":"ok"}')"#,
+            [],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn repoints_opencode_structure_and_event_log() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let codex_home = temporary.path().join(".codex");
+        fs::create_dir_all(&codex_home)?;
+        let opencode_home = temporary.path().join("share/opencode");
+        create_opencode_fixture(&opencode_home)?;
+
+        let migrator = Migrator::new(&codex_home)?.with_opencode(Some(opencode_home.clone()))?;
+        let plan = migrator.plan("/example/old-repo", "/example/new-repo")?;
+        assert!(plan.replacements() > 0);
+        let backup = migrator.apply(&plan)?.expect("backup should be created");
+        assert!(backup.join("manifest.json").is_file());
+        assert!(backup.join("opencode/opencode.db").is_file());
+
+        let verification = migrator.plan("/example/old-repo", "/example/new-repo")?;
+        assert_eq!(verification.replacements(), 0);
+
+        let database = Connection::open(opencode_home.join("opencode.db"))?;
+        let worktree: String =
+            database.query_row("SELECT worktree FROM project WHERE id='p1'", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(worktree, "/example/new-repo");
+        let sandboxes: String =
+            database.query_row("SELECT sandboxes FROM project WHERE id='p1'", [], |row| {
+                row.get(0)
+            })?;
+        assert!(sandboxes.contains("/example/new-repo"));
+        let directory: String = database.query_row(
+            "SELECT directory FROM project_directory WHERE project_id='p1'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(directory, "/example/new-repo");
+        let session: String =
+            database.query_row("SELECT directory FROM session WHERE id='s1'", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(session, "/example/new-repo/sub");
+        let path: String =
+            database.query_row("SELECT path FROM session WHERE id='s1'", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(path, "example/new-repo/sub");
+        let workspace: String =
+            database.query_row("SELECT directory FROM workspace WHERE id='w1'", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(workspace, "/example/new-repo");
+
+        let session_event: String =
+            database.query_row("SELECT data FROM event WHERE id='e1'", [], |row| row.get(0))?;
+        let session_event: Value = serde_json::from_str(&session_event)?;
+        assert_eq!(session_event["info"]["directory"], "/example/new-repo");
+        assert_eq!(session_event["info"]["path"], "example/new-repo");
+        assert_eq!(session_event["info"]["title"], "/example/old-repo");
+        let message_event: String =
+            database.query_row("SELECT data FROM event WHERE id='e2'", [], |row| row.get(0))?;
+        assert!(message_event.contains("/example/old-repo"));
+        Ok(())
+    }
+
+    #[test]
+    fn lists_and_previews_opencode_sessions() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let codex_home = temporary.path().join(".codex");
+        fs::create_dir_all(&codex_home)?;
+        let opencode_home = temporary.path().join("share/opencode");
+        create_opencode_fixture(&opencode_home)?;
+        let migrator = Migrator::new(&codex_home)?.with_opencode(Some(opencode_home.clone()))?;
+
+        let sessions = migrator.list_opencode_sessions(None)?;
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].session_id, "s1");
+        assert_eq!(sessions[0].cwd, PathBuf::from("/example/old-repo/sub"));
+        assert_eq!(sessions[0].title, "Sample session");
+
+        let by_path = migrator.list_opencode_sessions(Some("old-repo"))?;
+        assert_eq!(by_path.len(), 2);
+        assert!(
+            by_path
+                .iter()
+                .all(|session| session.match_excerpt.contains("工作目录"))
+        );
+        let by_slug = migrator.list_opencode_sessions(Some("main-session"))?;
+        assert_eq!(by_slug.len(), 1);
+        assert_eq!(by_slug[0].session_id, "s2");
+
+        let exact = migrator.find_opencode_sessions("/example/old-repo", false, None)?;
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].session_id, "s2");
+        let recursive = migrator.find_opencode_sessions("/example/old-repo", true, None)?;
+        assert_eq!(recursive.len(), 2);
+
+        let preview = migrator.opencode_session_preview("s1", 6, None)?;
+        assert_eq!(preview.user_messages, ["please repoint the sample repo"]);
+        let preview = migrator.opencode_session_preview("s1", 6, Some("sample"))?;
+        assert_eq!(preview.user_messages.len(), 1);
+        let empty = migrator.opencode_session_preview("s1", 6, Some("nomatch"))?;
+        assert!(empty.user_messages.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn repoints_single_opencode_session() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let codex_home = temporary.path().join(".codex");
+        fs::create_dir_all(&codex_home)?;
+        let opencode_home = temporary.path().join("share/opencode");
+        create_opencode_fixture(&opencode_home)?;
+        let migrator = Migrator::new(&codex_home)?.with_opencode(Some(opencode_home.clone()))?;
+
+        let (_session, plan) = migrator.plan_opencode_session("s2", "/example/new-repo")?;
+        assert!(plan.replacements() > 0);
+        migrator.apply(&plan)?;
+
+        let database = Connection::open(opencode_home.join("opencode.db"))?;
+        let s2: String =
+            database.query_row("SELECT directory FROM session WHERE id='s2'", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(s2, "/example/new-repo");
+        let s1: String =
+            database.query_row("SELECT directory FROM session WHERE id='s1'", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(s1, "/example/old-repo/sub");
+        let worktree: String =
+            database.query_row("SELECT worktree FROM project WHERE id='p1'", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(worktree, "/example/old-repo");
+        let event: String =
+            database.query_row("SELECT data FROM event WHERE id='e3'", [], |row| row.get(0))?;
+        let event: Value = serde_json::from_str(&event)?;
+        assert_eq!(event["info"]["directory"], "/example/new-repo");
         Ok(())
     }
 }

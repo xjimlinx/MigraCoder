@@ -19,6 +19,12 @@ enum Mode {
     Workspace,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Source {
+    Codex,
+    Opencode,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum TaskKind {
     Scan,
@@ -53,8 +59,10 @@ enum TaskPayload {
 #[derive(Clone)]
 struct ActionInput {
     mode: Mode,
+    source: Source,
     codex_home: PathBuf,
-    source: PathBuf,
+    opencode_home: Option<PathBuf>,
+    old: PathBuf,
     destination: PathBuf,
     session_id: Option<String>,
     move_files: bool,
@@ -90,7 +98,10 @@ pub fn run() -> Result<()> {
 
 struct MigraCoderApp {
     mode: Mode,
+    session_source: Source,
     codex_home: String,
+    opencode_home: String,
+    opencode_enabled: bool,
     source: String,
     destination: String,
     search: String,
@@ -117,9 +128,17 @@ impl MigraCoderApp {
         let codex_home = env::var_os("CODEX_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".codex"));
+        let opencode_home = env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/share"))
+            .join("opencode");
+        let opencode_enabled = opencode_home.is_dir();
         let mut app = Self {
             mode: Mode::Session,
+            session_source: Source::Codex,
             codex_home: codex_home.display().to_string(),
+            opencode_home: opencode_home.display().to_string(),
+            opencode_enabled,
             source: home.display().to_string(),
             destination: String::new(),
             search: String::new(),
@@ -167,9 +186,16 @@ impl MigraCoderApp {
         }
     }
 
+    fn opencode_home_option(&self) -> Option<PathBuf> {
+        self.opencode_enabled
+            .then(|| PathBuf::from(self.opencode_home.clone()))
+    }
+
     fn start_scan(&mut self, context: &egui::Context) {
         let codex_home = PathBuf::from(self.codex_home.clone());
-        let source = PathBuf::from(self.source.clone());
+        let opencode_home = self.opencode_home_option();
+        let source = self.session_source;
+        let target = PathBuf::from(self.source.clone());
         let filter_by_path = self.filter_by_path;
         let recursive = self.recursive;
         let search = (!self.search.trim().is_empty()).then(|| self.search.trim().to_owned());
@@ -177,11 +203,22 @@ impl MigraCoderApp {
         self.details.clear();
         self.selected_session = None;
         self.spawn_task(context, TaskKind::Scan, move || {
-            let migrator = Migrator::new(codex_home)?;
-            let sessions = if filter_by_path {
-                migrator.find_sessions(source, recursive, search.as_deref())?
-            } else {
-                migrator.list_sessions(search.as_deref())?
+            let migrator = Migrator::new(codex_home)?.with_opencode(opencode_home)?;
+            let sessions = match source {
+                Source::Codex => {
+                    if filter_by_path {
+                        migrator.find_sessions(target, recursive, search.as_deref())?
+                    } else {
+                        migrator.list_sessions(search.as_deref())?
+                    }
+                }
+                Source::Opencode => {
+                    if filter_by_path {
+                        migrator.find_opencode_sessions(target, recursive, search.as_deref())?
+                    } else {
+                        migrator.list_opencode_sessions(search.as_deref())?
+                    }
+                }
             };
             Ok(TaskPayload::Sessions(sessions))
         });
@@ -189,6 +226,11 @@ impl MigraCoderApp {
 
     fn action_input(&self) -> Result<ActionInput> {
         let codex_home = normalize_path(&self.codex_home)?;
+        let opencode_home = if self.opencode_enabled {
+            Some(normalize_path(&self.opencode_home)?)
+        } else {
+            None
+        };
         let source = normalize_path(&self.source)?;
         let mut destination = normalize_path(&self.destination)?;
         if self.mode == Mode::Session && !destination.is_dir() {
@@ -210,8 +252,10 @@ impl MigraCoderApp {
         };
         Ok(ActionInput {
             mode: self.mode,
+            source: self.session_source,
             codex_home,
-            source,
+            opencode_home,
+            old: source,
             destination,
             session_id,
             move_files: self.move_files,
@@ -224,7 +268,8 @@ impl MigraCoderApp {
                 self.status = "正在生成预览…".to_owned();
                 self.details.clear();
                 self.spawn_task(context, TaskKind::Preview, move || {
-                    let migrator = Migrator::new(&input.codex_home)?;
+                    let migrator = Migrator::new(&input.codex_home)?
+                        .with_opencode(input.opencode_home.clone())?;
                     let (_, plan) = create_plan(&migrator, &input)?;
                     Ok(TaskPayload::Message(plan_summary(&plan)))
                 });
@@ -240,10 +285,11 @@ impl MigraCoderApp {
                 self.details.clear();
                 let task_input = input.clone();
                 self.spawn_task(context, TaskKind::Review, move || {
-                    let migrator = Migrator::new(&task_input.codex_home)?;
+                    let migrator = Migrator::new(&task_input.codex_home)?
+                        .with_opencode(task_input.opencode_home.clone())?;
                     let (_, plan) = create_plan(&migrator, &task_input)?;
                     if plan.replacements() == 0 {
-                        bail!("没有找到需要修改的 Codex 指向，请检查源路径和会话")
+                        bail!("没有找到需要修改的指向，请检查源路径和会话")
                     }
                     Ok(TaskPayload::Review {
                         input,
@@ -257,10 +303,15 @@ impl MigraCoderApp {
 
     fn start_doctor(&mut self, context: &egui::Context) {
         let codex_home = PathBuf::from(self.codex_home.clone());
-        self.status = "正在检查 Codex 数据…".to_owned();
+        let opencode_home = self
+            .opencode_enabled
+            .then(|| PathBuf::from(self.opencode_home.clone()));
+        self.status = "正在检查本地数据…".to_owned();
         self.details.clear();
         self.spawn_task(context, TaskKind::Doctor, move || {
-            let report = Migrator::new(codex_home)?.doctor()?;
+            let report = Migrator::new(codex_home)?
+                .with_opencode(opencode_home)?
+                .doctor()?;
             let mut lines = vec![
                 format!("Codex 数据：{}", report.codex_home.display()),
                 format!(
@@ -268,6 +319,14 @@ impl MigraCoderApp {
                     report.sessions, report.workspaces, report.databases, report.backups
                 ),
             ];
+            match &report.opencode_home {
+                Some(home) => lines.push(format!(
+                    "opencode：{}（{} 个会话）",
+                    home.display(),
+                    report.opencode_sessions
+                )),
+                None => lines.push("opencode：未启用".to_owned()),
+            }
             if report.healthy() {
                 lines.push("检查通过。".to_owned());
             } else {
@@ -284,11 +343,18 @@ impl MigraCoderApp {
 
     fn start_detail(&mut self, context: &egui::Context, session_id: String) {
         let codex_home = PathBuf::from(self.codex_home.clone());
+        let opencode_home = self.opencode_home_option();
+        let source = self.session_source;
         let search = (!self.search.trim().is_empty()).then(|| self.search.trim().to_owned());
         self.status = "正在读取会话内容…".to_owned();
         self.spawn_task(context, TaskKind::Detail, move || {
-            let preview =
-                Migrator::new(codex_home)?.session_preview(&session_id, 6, search.as_deref())?;
+            let migrator = Migrator::new(codex_home)?.with_opencode(opencode_home)?;
+            let preview = match source {
+                Source::Codex => migrator.session_preview(&session_id, 6, search.as_deref())?,
+                Source::Opencode => {
+                    migrator.opencode_session_preview(&session_id, 6, search.as_deref())?
+                }
+            };
             Ok(TaskPayload::Detail(preview))
         });
     }
@@ -324,16 +390,17 @@ impl MigraCoderApp {
         self.status = "正在执行迁移，请勿关闭窗口…".to_owned();
         self.details.clear();
         self.spawn_task(context, TaskKind::Apply, move || {
-            let migrator = Migrator::new(&input.codex_home)?;
+            let migrator =
+                Migrator::new(&input.codex_home)?.with_opencode(input.opencode_home.clone())?;
             let (effective_destination, plan) = create_plan(&migrator, &input)?;
             let moved = input.mode == Mode::Workspace && input.move_files;
             if moved {
-                move_workspace(&input.source, &effective_destination)?;
+                move_workspace(&input.old, &effective_destination)?;
             }
             let applied = migrator.apply(&plan);
             if let Err(error) = applied {
                 if moved {
-                    rollback_workspace_move(&input.source, &effective_destination)?;
+                    rollback_workspace_move(&input.old, &effective_destination)?;
                 }
                 return Err(error);
             }
@@ -341,18 +408,23 @@ impl MigraCoderApp {
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "无需备份（没有匹配指向）".to_owned());
             let verification = match input.mode {
-                Mode::Session => match migrator
-                    .resolve_session(input.session_id.as_deref().unwrap_or_default())
-                {
-                    Ok(session) if session.cwd == effective_destination => {
-                        "验证通过：会话已指向目标目录".to_owned()
+                Mode::Session => {
+                    let session_id = input.session_id.as_deref().unwrap_or_default();
+                    let resolved = match input.source {
+                        Source::Codex => migrator.resolve_session(session_id),
+                        Source::Opencode => migrator.resolve_opencode_session(session_id),
+                    };
+                    match resolved {
+                        Ok(session) if session.cwd == effective_destination => {
+                            "验证通过：会话已指向目标目录".to_owned()
+                        }
+                        Ok(session) => {
+                            format!("验证警告：读取到的会话路径仍为 {}", session.cwd.display())
+                        }
+                        Err(error) => format!("验证警告：无法重新读取会话（{error:#}）"),
                     }
-                    Ok(session) => {
-                        format!("验证警告：读取到的会话路径仍为 {}", session.cwd.display())
-                    }
-                    Err(error) => format!("验证警告：无法重新读取会话（{error:#}）"),
-                },
-                Mode::Workspace => match migrator.plan(&input.source, &effective_destination) {
+                }
+                Mode::Workspace => match migrator.plan(&input.old, &effective_destination) {
                     Ok(plan) if plan.replacements() == 0 => "验证通过：旧路径指向已清除".to_owned(),
                     Ok(plan) => format!("验证警告：仍发现 {} 处旧路径指向", plan.replacements()),
                     Err(error) => format!("验证警告：无法重新扫描（{error:#}）"),
@@ -474,13 +546,13 @@ impl MigraCoderApp {
                         ));
                     }
                     Mode::Workspace if input.move_files => {
-                        ui.label("将移动整个目录，并更新该路径下的全部 Codex 会话。");
+                        ui.label("将移动整个目录，并更新该路径下的全部 Codex 与 opencode 会话。");
                     }
                     Mode::Workspace => {
-                        ui.label("只修复整个路径的 Codex 指向，不移动磁盘文件。");
+                        ui.label("只修复整个路径的 Codex 与 opencode 指向，不移动磁盘文件。");
                     }
                 }
-                ui.label(format!("源：{}", input.source.display()));
+                ui.label(format!("源：{}", input.old.display()));
                 ui.label(format!("目标：{}", input.destination.display()));
                 ui.separator();
                 ui.monospace(&self.confirm_summary);
@@ -511,6 +583,7 @@ impl MigraCoderApp {
         let mut open = true;
         let mut close = false;
         let mut rename = None;
+        let source = self.session_source;
         egui::Window::new("会话内容")
             .open(&mut open)
             .default_width(620.0)
@@ -543,7 +616,7 @@ impl MigraCoderApp {
                     });
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("修改标题…").clicked() {
+                    if source == Source::Codex && ui.button("修改标题…").clicked() {
                         rename = Some(RenameInput {
                             session_id: preview.session.session_id.clone(),
                             current_title: preview.session.title.clone(),
@@ -554,7 +627,7 @@ impl MigraCoderApp {
                         context.copy_text(preview.session.session_id.clone());
                     }
                     if ui.button("复制 resume 命令").clicked() {
-                        context.copy_text(resume_command(&preview.session));
+                        context.copy_text(resume_command(&preview.session, source));
                     }
                 });
                 ui.separator();
@@ -656,7 +729,7 @@ impl eframe::App for MigraCoderApp {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.heading("MigraCoder");
-                ui.label("迁移目录时保持 Codex 会话可恢复");
+                ui.label("迁移目录时保持 Codex 与 opencode 会话可恢复");
             });
             ui.add_space(6.0);
         });
@@ -679,6 +752,15 @@ impl eframe::App for MigraCoderApp {
 
                 path_row(ui, "Codex 数据", &mut self.codex_home, None);
                 ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.opencode_enabled, "同时处理 opencode 会话");
+                    if !self.opencode_enabled {
+                        ui.weak("仅更新 Codex 指向");
+                    }
+                });
+                ui.add_enabled_ui(self.opencode_enabled, |ui| {
+                    path_row(ui, "opencode 数据", &mut self.opencode_home, None);
+                });
+                ui.horizontal(|ui| {
                     if ui.small_button("检查环境").clicked() {
                         self.start_doctor(context);
                     }
@@ -688,6 +770,18 @@ impl eframe::App for MigraCoderApp {
                 let previous_source = self.source.clone();
                 let mut pick_source = false;
                 if self.mode == Mode::Session {
+                    let previous_kind = self.session_source;
+                    ui.horizontal(|ui| {
+                        ui.label("会话来源");
+                        ui.selectable_value(&mut self.session_source, Source::Codex, "Codex");
+                        ui.selectable_value(&mut self.session_source, Source::Opencode, "opencode");
+                        if self.session_source == Source::Opencode && !self.opencode_enabled {
+                            ui.weak("请先启用上方 opencode 数据");
+                        }
+                    });
+                    if self.session_source != previous_kind {
+                        self.start_scan(context);
+                    }
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut self.filter_by_path, "按工作目录筛选");
                         if !self.filter_by_path {
@@ -714,10 +808,12 @@ impl eframe::App for MigraCoderApp {
                 if self.mode == Mode::Session {
                     ui.horizontal(|ui| {
                         ui.label("关键词");
-                        let response = ui.add(
-                            egui::TextEdit::singleline(&mut self.search)
-                                .hint_text("标题、路径、会话 ID 或消息正文"),
-                        );
+                        let hint = match self.session_source {
+                            Source::Codex => "标题、路径、会话 ID 或消息正文",
+                            Source::Opencode => "标题、路径、会话 ID 或 slug",
+                        };
+                        let response =
+                            ui.add(egui::TextEdit::singleline(&mut self.search).hint_text(hint));
                         if response.changed() {
                             self.selected_session = None;
                         }
@@ -860,7 +956,7 @@ impl eframe::App for MigraCoderApp {
                     if self.move_files {
                         ui.weak("目标若是已有目录，将在其中保留源目录名（与 mv 相同）。");
                     } else {
-                        ui.weak("仅修复 Codex 指向，适合目录已经由其他方式移动的情况。");
+                        ui.weak("仅修复指向，适合目录已经由其他方式移动的情况。");
                     }
                 }
 
@@ -970,19 +1066,24 @@ fn create_plan(migrator: &Migrator, input: &ActionInput) -> Result<(PathBuf, Pla
                 .session_id
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("missing session id"))?;
-            let (_, plan) = migrator.plan_session(session_id, &input.destination)?;
+            let (_, plan) = match input.source {
+                Source::Codex => migrator.plan_session(session_id, &input.destination)?,
+                Source::Opencode => {
+                    migrator.plan_opencode_session(session_id, &input.destination)?
+                }
+            };
             Ok((input.destination.clone(), plan))
         }
         Mode::Workspace if input.move_files => {
-            let (_, destination) = validate_workspace_move(&input.source, &input.destination)?;
-            let plan = migrator.plan(&input.source, &destination)?;
+            let (_, destination) = validate_workspace_move(&input.old, &input.destination)?;
+            let plan = migrator.plan(&input.old, &destination)?;
             Ok((destination, plan))
         }
         Mode::Workspace => {
             if !input.destination.is_dir() {
                 bail!("仅修复指向时，目标目录必须已经存在");
             }
-            let plan = migrator.plan(&input.source, &input.destination)?;
+            let plan = migrator.plan(&input.old, &input.destination)?;
             Ok((input.destination.clone(), plan))
         }
     }
@@ -990,7 +1091,7 @@ fn create_plan(migrator: &Migrator, input: &ActionInput) -> Result<(PathBuf, Pla
 
 fn plan_summary(plan: &Plan) -> String {
     let mut lines = vec![
-        format!("Codex: {} -> {}", plan.old.display(), plan.new.display()),
+        format!("计划：{} -> {}", plan.old.display(), plan.new.display()),
         format!("共 {} 个文件，{} 处指向", plan.files(), plan.replacements()),
     ];
     lines.extend(
@@ -1020,11 +1121,14 @@ fn compact_title(title: &str, max_chars: usize) -> String {
     }
 }
 
-fn resume_command(session: &SessionInfo) -> String {
+fn resume_command(session: &SessionInfo, source: Source) -> String {
+    let command = match source {
+        Source::Codex => format!("codex resume {}", shell_quote(&session.session_id)),
+        Source::Opencode => format!("opencode --session {}", shell_quote(&session.session_id)),
+    };
     format!(
-        "cd {} && codex resume {}",
-        shell_quote(&session.cwd.display().to_string()),
-        shell_quote(&session.session_id)
+        "cd {} && {command}",
+        shell_quote(&session.cwd.display().to_string())
     )
 }
 

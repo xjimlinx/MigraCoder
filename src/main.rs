@@ -27,6 +27,18 @@ struct Cli {
     )]
     codex_home: Option<PathBuf>,
 
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        value_hint = ValueHint::DirPath,
+        help = "opencode 数据目录"
+    )]
+    opencode_home: Option<PathBuf>,
+
+    #[arg(long, global = true, help = "跳过 opencode 会话")]
+    no_opencode: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -123,8 +135,16 @@ fn run() -> Result<()> {
     if matches!(&cli.command, Commands::Gui) {
         return migracoder::gui::run();
     }
+    let opencode_home = if cli.no_opencode {
+        None
+    } else {
+        match &cli.opencode_home {
+            Some(path) => Some(normalize_path(path)?),
+            None => default_opencode_home(),
+        }
+    };
     let codex_home = cli.codex_home.unwrap_or_else(default_codex_home);
-    let migrator = Migrator::new(codex_home)?;
+    let migrator = Migrator::new(codex_home)?.with_opencode(opencode_home)?;
     match cli.command {
         Commands::Sessions {
             path,
@@ -231,6 +251,14 @@ fn run() -> Result<()> {
                 "会话：{}  工作区：{}  数据库：{}  备份：{}",
                 report.sessions, report.workspaces, report.databases, report.backups
             );
+            match &report.opencode_home {
+                Some(home) => println!(
+                    "opencode 数据：{}（{} 个会话）",
+                    home.display(),
+                    report.opencode_sessions
+                ),
+                None => println!("opencode 数据：未启用"),
+            }
             if report.healthy() {
                 println!("检查通过");
             } else {
@@ -244,14 +272,11 @@ fn run() -> Result<()> {
             let new = normalize_path(new)?;
             let plan = migrator.plan(&old, &new)?;
             if plan.replacements() == 0 {
-                println!("验证通过：未发现仍指向 {} 的 Codex 数据", old.display());
+                println!("验证通过：未发现仍指向 {} 的数据", old.display());
                 println!("目标：{}", new.display());
             } else {
                 print_plan(&plan);
-                bail!(
-                    "验证失败：仍有 {} 处 Codex 指向使用旧路径",
-                    plan.replacements()
-                );
+                bail!("验证失败：仍有 {} 处指向使用旧路径", plan.replacements());
             }
         }
         Commands::Completions { .. } => unreachable!("handled before Codex initialization"),
@@ -282,8 +307,16 @@ fn default_codex_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".codex"))
 }
 
+fn default_opencode_home() -> Option<PathBuf> {
+    let data_home = env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))?;
+    let home = data_home.join("opencode");
+    home.is_dir().then_some(home)
+}
+
 fn print_plan(plan: &migracoder::Plan) {
-    println!("Codex: {} -> {}", plan.old.display(), plan.new.display());
+    println!("计划：{} -> {}", plan.old.display(), plan.new.display());
     for description in plan.descriptions() {
         println!("  {description}");
     }
@@ -292,8 +325,8 @@ fn print_plan(plan: &migracoder::Plan) {
 
 fn finish_apply(migrator: &Migrator, plan: &migracoder::Plan, new: &Path) -> Result<()> {
     match migrator.apply(plan)? {
-        Some(backup) => println!("Codex 指向已更新；备份：{}", backup.display()),
-        None => println!("未找到需要更新的 Codex 指向"),
+        Some(backup) => println!("指向已更新；备份：{}", backup.display()),
+        None => println!("未找到需要更新的指向"),
     }
     println!("可验证：cd '{}' && codex resume --last", new.display());
     Ok(())
