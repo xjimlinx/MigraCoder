@@ -1,6 +1,7 @@
 use crate::{
-    Migrator, Plan, SessionAction, SessionActionPlan, SessionInfo, SessionPreview, move_workspace,
-    normalize_path, rollback_workspace_move, validate_workspace_move,
+    Migrator, Plan, SessionAction, SessionActionPlan, SessionInfo, SessionPreview,
+    SessionStore as Source, move_workspace, normalize_path, rollback_workspace_move,
+    validate_workspace_move,
 };
 use anyhow::{Result, bail};
 use chrono::{Local, TimeZone};
@@ -18,12 +19,6 @@ use std::time::Duration;
 enum Mode {
     Session,
     Workspace,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Source {
-    Codex,
-    Opencode,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -47,6 +42,10 @@ struct TaskResult {
 enum TaskPayload {
     Sessions(Vec<SessionInfo>),
     Message(String),
+    Applied {
+        sessions: Vec<SessionInfo>,
+        message: String,
+    },
     Review {
         input: ActionInput,
         summary: String,
@@ -153,8 +152,14 @@ impl MigraCoderApp {
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".local/share"))
             .join("opencode");
+        let mut app = Self::initial_state(codex_home, opencode_home, home);
+        app.start_scan(&creation_context.egui_ctx);
+        app
+    }
+
+    fn initial_state(codex_home: PathBuf, opencode_home: PathBuf, home: PathBuf) -> Self {
         let opencode_enabled = opencode_home.is_dir();
-        let mut app = Self {
+        Self {
             mode: Mode::Session,
             session_source: Source::Codex,
             codex_home: codex_home.display().to_string(),
@@ -180,9 +185,7 @@ impl MigraCoderApp {
             rename_dialog: None,
             confirm_session_actions: Vec::new(),
             confirm_session_action_summary: String::new(),
-        };
-        app.start_scan(&creation_context.egui_ctx);
-        app
+        }
     }
 
     fn busy(&self) -> bool {
@@ -201,6 +204,46 @@ impl MigraCoderApp {
         self.selected_session = None;
         self.selected_sessions.clear();
         self.session_detail = None;
+    }
+
+    fn update_session_results(&mut self, updates: Vec<SessionInfo>, deleted_ids: &[String]) {
+        for mut updated in updates {
+            if let Some(item) = self
+                .sessions
+                .iter_mut()
+                .find(|item| item.session_id == updated.session_id)
+            {
+                // Keep this search's excerpt and row position even when the new
+                // title or directory would no longer match the original query.
+                updated.match_excerpt = item.match_excerpt.clone();
+                *item = updated.clone();
+            }
+            if let Some(preview) = self
+                .session_detail
+                .as_mut()
+                .filter(|preview| preview.session.session_id == updated.session_id)
+            {
+                preview.session = updated;
+            }
+        }
+        self.sessions
+            .retain(|item| !deleted_ids.contains(&item.session_id));
+        self.selected_sessions
+            .retain(|id| !deleted_ids.contains(id));
+        if self
+            .selected_session
+            .as_ref()
+            .is_some_and(|id| deleted_ids.contains(id))
+        {
+            self.selected_session = None;
+        }
+        if self
+            .session_detail
+            .as_ref()
+            .is_some_and(|preview| deleted_ids.contains(&preview.session.session_id))
+        {
+            self.session_detail = None;
+        }
     }
 
     fn choose_source(&mut self) {
@@ -299,9 +342,6 @@ impl MigraCoderApp {
                     bail!("请先勾选至少一个会话");
                 }
                 bail!("勾选的会话已经全部指向目标目录");
-            }
-            if self.session_source == Source::Opencode && selected.len() != 1 {
-                bail!("opencode 当前仅支持单个会话修复");
             }
             selected
         } else {
@@ -468,13 +508,18 @@ impl MigraCoderApp {
         action: SessionAction,
     ) {
         let codex_home = PathBuf::from(self.codex_home.clone());
+        let source = self.session_source;
+        let opencode_home = self.opencode_home_option();
         self.status = format!("正在检查{}操作…", action.label());
         self.details.clear();
         self.spawn_task(context, TaskKind::SessionActionReview, move || {
-            let migrator = Migrator::new(codex_home)?;
+            let migrator = Migrator::new(codex_home)?.with_opencode(opencode_home)?;
             let plans = session_ids
                 .iter()
-                .map(|session_id| migrator.plan_session_action(session_id, action))
+                .map(|session_id| match source {
+                    Source::Codex => migrator.plan_session_action(session_id, action),
+                    Source::Opencode => migrator.plan_opencode_session_action(session_id, action),
+                })
                 .collect::<Result<Vec<_>>>()?;
             let summary = session_actions_summary(&plans);
             Ok(TaskPayload::SessionActionReview { plans, summary })
@@ -483,6 +528,8 @@ impl MigraCoderApp {
 
     fn start_session_actions(&mut self, context: &egui::Context, plans: Vec<SessionActionPlan>) {
         let codex_home = PathBuf::from(self.codex_home.clone());
+        let opencode_home = self.opencode_home_option();
+        let source = self.session_source;
         let action = plans
             .first()
             .map(|plan| plan.action)
@@ -494,7 +541,7 @@ impl MigraCoderApp {
         self.status = format!("正在{}会话，请勿关闭窗口…", action.label());
         self.details.clear();
         self.spawn_task(context, TaskKind::SessionActionApply, move || {
-            let migrator = Migrator::new(codex_home)?;
+            let migrator = Migrator::new(codex_home)?.with_opencode(opencode_home)?;
             let summary = session_actions_summary(&plans);
             let backups = migrator.apply_session_actions(&plans)?;
             let sessions = if action == SessionAction::Delete {
@@ -502,7 +549,7 @@ impl MigraCoderApp {
             } else {
                 session_ids
                     .iter()
-                    .map(|session_id| migrator.resolve_session(session_id))
+                    .map(|session_id| resolve_session(&migrator, source, session_id))
                     .collect::<Result<Vec<_>>>()?
             };
             Ok(TaskPayload::SessionActionDone {
@@ -521,6 +568,11 @@ impl MigraCoderApp {
     }
 
     fn start_apply(&mut self, context: &egui::Context, input: ActionInput) {
+        let displayed_ids = self
+            .sessions
+            .iter()
+            .map(|session| session.session_id.clone())
+            .collect::<Vec<_>>();
         self.status = "正在执行迁移，请勿关闭窗口…".to_owned();
         self.details.clear();
         self.spawn_task(context, TaskKind::Apply, move || {
@@ -529,22 +581,17 @@ impl MigraCoderApp {
             let (effective_destination, plans) = create_plans(&migrator, &input)?;
             let summary = plans_summary(&plans);
             if input.mode == Mode::Session {
-                let backups =
-                    apply_session_plans(&migrator, &input, &effective_destination, &plans)?;
-                let mismatches = input
+                let backups = apply_session_plans(&migrator, &input, &effective_destination)?;
+                let sessions = input
                     .session_ids
                     .iter()
-                    .filter(|session_id| {
-                        let resolved = match input.source {
-                            Source::Codex => migrator.resolve_session(session_id),
-                            Source::Opencode => migrator.resolve_opencode_session(session_id),
-                        };
-                        match resolved {
-                            Ok(session) => session.cwd != effective_destination,
-                            Err(_) => true,
-                        }
-                    })
-                    .count();
+                    .filter_map(|id| resolve_session(&migrator, input.source, id).ok())
+                    .collect::<Vec<_>>();
+                let mismatches = input.session_ids.len()
+                    - sessions
+                        .iter()
+                        .filter(|session| session.cwd == effective_destination)
+                        .count();
                 let verification = if mismatches == 0 {
                     format!(
                         "验证通过：{} 个会话均已指向目标目录",
@@ -553,14 +600,17 @@ impl MigraCoderApp {
                 } else {
                     format!("验证警告：有 {mismatches} 个会话未能确认新指向")
                 };
-                return Ok(TaskPayload::Message(format!(
-                    "迁移完成\n目标：{}\n会话：{}\n备份：{} 份\n{}\n\n{}",
-                    effective_destination.display(),
-                    input.session_ids.len(),
-                    backups.len(),
-                    verification,
-                    summary
-                )));
+                return Ok(TaskPayload::Applied {
+                    sessions,
+                    message: format!(
+                        "迁移完成\n目标：{}\n会话：{}\n备份：{} 份\n{}\n\n{}",
+                        effective_destination.display(),
+                        input.session_ids.len(),
+                        backups.len(),
+                        verification,
+                        summary
+                    ),
+                });
             }
 
             let plan = plans
@@ -586,13 +636,20 @@ impl MigraCoderApp {
                 Ok(plan) => format!("验证警告：仍发现 {} 处旧路径指向", plan.replacements()),
                 Err(error) => format!("验证警告：无法重新扫描（{error:#}）"),
             };
-            Ok(TaskPayload::Message(format!(
-                "迁移完成\n目标：{}\n备份：{}\n{}\n\n{}",
-                effective_destination.display(),
-                backup,
-                verification,
-                summary
-            )))
+            let sessions = displayed_ids
+                .iter()
+                .filter_map(|id| resolve_session(&migrator, input.source, id).ok())
+                .collect();
+            Ok(TaskPayload::Applied {
+                sessions,
+                message: format!(
+                    "迁移完成\n目标：{}\n备份：{}\n{}\n\n{}",
+                    effective_destination.display(),
+                    backup,
+                    verification,
+                    summary
+                ),
+            })
         });
     }
 
@@ -637,9 +694,11 @@ impl MigraCoderApp {
                     TaskKind::SessionActionApply => "会话操作完成。".to_owned(),
                 };
                 self.details = message;
-                if matches!(result.kind, TaskKind::Apply) {
-                    self.clear_session_state();
-                }
+            }
+            Ok(TaskPayload::Applied { sessions, message }) => {
+                self.update_session_results(sessions, &[]);
+                self.status = "迁移成功，搜索结果已更新。".to_owned();
+                self.details = message;
             }
             Ok(TaskPayload::Review { input, summary }) => {
                 self.status = "变更检查完成，请确认后执行。".to_owned();
@@ -702,41 +761,12 @@ impl MigraCoderApp {
                 sessions,
                 message,
             }) => {
-                for updated in sessions {
-                    if let Some(item) = self
-                        .sessions
-                        .iter_mut()
-                        .find(|item| item.session_id == updated.session_id)
-                    {
-                        *item = updated.clone();
-                    }
-                    if let Some(preview) = self
-                        .session_detail
-                        .as_mut()
-                        .filter(|preview| preview.session.session_id == updated.session_id)
-                    {
-                        preview.session = updated;
-                    }
-                }
-                if action == SessionAction::Delete {
-                    self.sessions
-                        .retain(|item| !session_ids.contains(&item.session_id));
-                }
-                if self
-                    .selected_session
-                    .as_ref()
-                    .is_some_and(|id| session_ids.contains(id))
-                {
-                    self.selected_session = None;
-                }
-                self.selected_sessions
-                    .retain(|id| !session_ids.contains(id));
-                if self.session_detail.as_ref().is_some_and(|preview| {
-                    session_ids.contains(&preview.session.session_id)
-                        && action == SessionAction::Delete
-                }) {
-                    self.session_detail = None;
-                }
+                let deleted_ids = if action == SessionAction::Delete {
+                    session_ids.as_slice()
+                } else {
+                    &[]
+                };
+                self.update_session_results(sessions, deleted_ids);
                 self.status = format!("已{} {} 个会话。", action.label(), session_ids.len());
                 self.details = message;
             }
@@ -828,7 +858,7 @@ impl MigraCoderApp {
                     SessionAction::Delete => {
                         ui.colored_label(
                             ui.visuals().error_fg_color,
-                            "会话文件和索引记录将被删除；MigraCoder 会先创建恢复备份。",
+                            "选中的会话及关联记录将被删除；MigraCoder 会先创建恢复备份。",
                         );
                     }
                 }
@@ -921,28 +951,24 @@ impl MigraCoderApp {
                         if ui.button("复制 resume 命令").clicked() {
                             context.copy_text(resume_command(&preview.session, source));
                         }
-                        if source == Source::Codex {
-                            let archive_action = if preview.session.archived {
-                                SessionAction::Unarchive
-                            } else {
-                                SessionAction::Archive
-                            };
-                            if ui.button(archive_action.label()).clicked() {
-                                session_action =
-                                    Some((preview.session.session_id.clone(), archive_action));
-                            }
-                            if ui
-                                .add(
-                                    egui::Button::new("删除…")
-                                        .fill(ui.visuals().error_fg_color.gamma_multiply(0.8)),
-                                )
-                                .clicked()
-                            {
-                                session_action = Some((
-                                    preview.session.session_id.clone(),
-                                    SessionAction::Delete,
-                                ));
-                            }
+                        let archive_action = if preview.session.archived {
+                            SessionAction::Unarchive
+                        } else {
+                            SessionAction::Archive
+                        };
+                        if ui.button(archive_action.label()).clicked() {
+                            session_action =
+                                Some((preview.session.session_id.clone(), archive_action));
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new("删除…")
+                                    .fill(ui.visuals().error_fg_color.gamma_multiply(0.8)),
+                            )
+                            .clicked()
+                        {
+                            session_action =
+                                Some((preview.session.session_id.clone(), SessionAction::Delete));
                         }
                     });
                 });
@@ -1265,9 +1291,7 @@ impl eframe::App for MigraCoderApp {
                     ui.horizontal(|ui| {
                         ui.label(format!("会话列表（{}）", self.sessions.len()));
                         ui.label(format!("已选 {}", self.selected_sessions.len()));
-                        if self.session_source == Source::Codex
-                            && ui.small_button("全选当前结果").clicked()
-                        {
+                        if ui.small_button("全选当前结果").clicked() {
                             self.selected_sessions.extend(
                                 self.sessions
                                     .iter()
@@ -1284,11 +1308,7 @@ impl eframe::App for MigraCoderApp {
                             self.selected_sessions.clear();
                             self.selected_session = None;
                         }
-                        ui.weak(if self.session_source == Source::Codex {
-                            "复选框支持多选，双击标题查看内容"
-                        } else {
-                            "单选一个会话，双击标题查看内容"
-                        });
+                        ui.weak("复选框支持多选，双击标题查看内容");
                     });
                     let widths = session_table_widths(ui.available_width());
                     egui::Frame::new()
@@ -1398,9 +1418,6 @@ impl eframe::App for MigraCoderApp {
                                     self.source = path;
                                 }
                                 if checked {
-                                    if self.session_source == Source::Opencode {
-                                        self.selected_sessions.clear();
-                                    }
                                     self.selected_sessions.insert(session.session_id.clone());
                                 } else {
                                     self.selected_sessions.remove(&session.session_id);
@@ -1453,13 +1470,12 @@ impl eframe::App for MigraCoderApp {
                                 self.start_detail(context, session_id);
                             }
                         }
-                        if self.session_source == Source::Codex
-                            && ui
-                                .add_enabled(
-                                    !active_ids.is_empty(),
-                                    egui::Button::new(format!("归档（{}）", active_ids.len())),
-                                )
-                                .clicked()
+                        if ui
+                            .add_enabled(
+                                !active_ids.is_empty(),
+                                egui::Button::new(format!("归档（{}）", active_ids.len())),
+                            )
+                            .clicked()
                         {
                             self.review_session_actions(
                                 context,
@@ -1467,16 +1483,12 @@ impl eframe::App for MigraCoderApp {
                                 SessionAction::Archive,
                             );
                         }
-                        if self.session_source == Source::Codex
-                            && ui
-                                .add_enabled(
-                                    !archived_ids.is_empty(),
-                                    egui::Button::new(format!(
-                                        "取消归档（{}）",
-                                        archived_ids.len()
-                                    )),
-                                )
-                                .clicked()
+                        if ui
+                            .add_enabled(
+                                !archived_ids.is_empty(),
+                                egui::Button::new(format!("取消归档（{}）", archived_ids.len())),
+                            )
+                            .clicked()
                         {
                             self.review_session_actions(
                                 context,
@@ -1484,17 +1496,13 @@ impl eframe::App for MigraCoderApp {
                                 SessionAction::Unarchive,
                             );
                         }
-                        if self.session_source == Source::Codex
-                            && ui
-                                .add_enabled(
-                                    !all_selected_ids.is_empty(),
-                                    egui::Button::new(format!(
-                                        "删除（{}）…",
-                                        all_selected_ids.len()
-                                    ))
+                        if ui
+                            .add_enabled(
+                                !all_selected_ids.is_empty(),
+                                egui::Button::new(format!("删除（{}）…", all_selected_ids.len()))
                                     .fill(ui.visuals().error_fg_color.gamma_multiply(0.8)),
-                                )
-                                .clicked()
+                            )
+                            .clicked()
                         {
                             self.review_session_actions(
                                 context,
@@ -1621,9 +1629,6 @@ fn create_plans(migrator: &Migrator, input: &ActionInput) -> Result<(PathBuf, Ve
             if input.session_ids.is_empty() {
                 bail!("请先选择会话");
             }
-            if input.source == Source::Opencode && input.session_ids.len() != 1 {
-                bail!("opencode 当前仅支持单个会话修复");
-            }
             let plans = input
                 .session_ids
                 .iter()
@@ -1658,16 +1663,19 @@ fn apply_session_plans(
     migrator: &Migrator,
     input: &ActionInput,
     destination: &Path,
-    plans: &[Plan],
 ) -> Result<Vec<PathBuf>> {
     match input.source {
         Source::Codex => migrator.apply_session_repoints(&input.session_ids, destination),
         Source::Opencode => {
-            if input.session_ids.len() != 1 || plans.len() != 1 {
-                bail!("opencode 当前仅支持单个会话修复");
-            }
-            Ok(migrator.apply(&plans[0])?.into_iter().collect())
+            migrator.apply_opencode_session_repoints(&input.session_ids, destination)
         }
+    }
+}
+
+fn resolve_session(migrator: &Migrator, source: Source, session_id: &str) -> Result<SessionInfo> {
+    match source {
+        Source::Codex => migrator.resolve_session(session_id),
+        Source::Opencode => migrator.resolve_opencode_session(session_id),
     }
 }
 
@@ -1891,6 +1899,133 @@ fn fc_match(query: &str) -> Option<(PathBuf, u32)> {
 mod tests {
     use super::*;
 
+    fn finish_task(app: &mut MigraCoderApp) -> Result<()> {
+        let result = app
+            .task
+            .take()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))?;
+        if let Err(error) = &result.result {
+            bail!("background task failed: {error:#}");
+        }
+        let (sender, receiver) = mpsc::channel();
+        sender.send(result)?;
+        app.task = Some(receiver);
+        app.poll_task();
+        Ok(())
+    }
+
+    #[test]
+    fn search_results_survive_migration_and_session_actions_for_both_stores() -> Result<()> {
+        for source in [Source::Codex, Source::Opencode] {
+            let (temporary, migrator, _) = crate::tests::create_fixture()?;
+            let opencode_home = temporary.path().join("opencode");
+            crate::tests::create_opencode_fixture(&opencode_home)?;
+            let migrator = migrator.with_opencode(Some(opencode_home.clone()))?;
+            let mut app = MigraCoderApp::initial_state(
+                migrator.codex_home.clone(),
+                opencode_home,
+                temporary.path().to_owned(),
+            );
+            app.session_source = source;
+            app.source = "/example/old-repo".to_owned();
+            app.search = "old-repo".to_owned();
+            app.filter_by_path = true;
+            app.recursive = true;
+            app.sessions = match source {
+                Source::Codex => migrator.find_sessions(&app.source, true, Some(&app.search))?,
+                Source::Opencode => {
+                    migrator.find_opencode_sessions(&app.source, true, Some(&app.search))?
+                }
+            };
+            assert_eq!(app.sessions.len(), 2);
+            let ids = app
+                .sessions
+                .iter()
+                .map(|s| s.session_id.clone())
+                .collect::<Vec<_>>();
+            app.selected_sessions.extend(ids.iter().cloned());
+            app.selected_session = Some(ids[0].clone());
+            let context = egui::Context::default();
+            app.start_detail(&context, ids[0].clone());
+            finish_task(&mut app)?;
+            let message_count = app.session_detail.as_ref().unwrap().messages.len();
+            let destination = temporary.path().join("destination");
+            fs::create_dir(&destination)?;
+            app.destination = destination.display().to_string();
+            // Operate on one result; the remaining result and its selection stay available.
+            let mut input = app.action_input()?;
+            input.session_ids = vec![ids[0].clone()];
+            app.start_apply(&context, input);
+            finish_task(&mut app)?;
+            assert_eq!(app.sessions.len(), 2);
+            assert_eq!(app.sessions[0].cwd, destination);
+            assert_ne!(app.sessions[1].cwd, destination);
+            assert_eq!(
+                app.sessions
+                    .iter()
+                    .map(|s| s.session_id.clone())
+                    .collect::<Vec<_>>(),
+                ids
+            );
+            assert_eq!(app.selected_sessions.len(), 2);
+            assert_eq!(app.selected_session.as_ref(), Some(&ids[0]));
+            assert_eq!(app.search, "old-repo");
+            assert_eq!(app.source, "/example/old-repo");
+            assert!(app.filter_by_path && app.recursive);
+            assert_eq!(
+                app.session_detail.as_ref().unwrap().session.cwd,
+                destination
+            );
+            assert_eq!(
+                app.session_detail.as_ref().unwrap().messages.len(),
+                message_count
+            );
+            // Process the other result without searching again.
+            app.start_apply(&context, app.action_input()?);
+            finish_task(&mut app)?;
+            assert!(app.sessions.iter().all(|s| s.cwd == destination));
+            for action in [SessionAction::Archive, SessionAction::Unarchive] {
+                app.review_session_actions(&context, ids.clone(), action);
+                finish_task(&mut app)?;
+                assert_eq!(app.confirm_session_actions.len(), 2);
+                let plans = std::mem::take(&mut app.confirm_session_actions);
+                app.start_session_actions(&context, plans);
+                finish_task(&mut app)?;
+                if action != SessionAction::Delete {
+                    assert_eq!(app.sessions.len(), 2);
+                    assert_eq!(app.selected_sessions.len(), 2);
+                    assert!(
+                        app.sessions
+                            .iter()
+                            .all(|s| s.archived == (action == SessionAction::Archive))
+                    );
+                }
+            }
+            for (index, id) in ids.iter().enumerate() {
+                app.review_session_actions(&context, vec![id.clone()], SessionAction::Delete);
+                finish_task(&mut app)?;
+                let plans = std::mem::take(&mut app.confirm_session_actions);
+                app.start_session_actions(&context, plans);
+                finish_task(&mut app)?;
+                assert_eq!(app.sessions.len(), ids.len() - index - 1);
+                assert_eq!(app.selected_sessions.len(), ids.len() - index - 1);
+                assert_eq!(app.search, "old-repo");
+            }
+            assert!(app.sessions.is_empty());
+            assert!(app.selected_sessions.is_empty());
+            assert!(app.selected_session.is_none());
+            assert!(app.session_detail.is_none());
+            assert_eq!(app.search, "old-repo");
+            // The other store is untouched by all the operations above.
+            match source {
+                Source::Codex => assert_eq!(migrator.list_opencode_sessions(None)?.len(), 2),
+                Source::Opencode => assert_eq!(migrator.list_sessions(None)?.len(), 2),
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn session_migration_routes_to_the_selected_store() -> Result<()> {
         let (temporary, migrator, _session_path) = crate::tests::create_fixture()?;
@@ -1909,7 +2044,8 @@ mod tests {
         };
 
         let (destination, plans) = create_plans(&migrator, &input)?;
-        let backups = apply_session_plans(&migrator, &input, &destination, &plans)?;
+        assert_eq!(plans.len(), input.session_ids.len());
+        let backups = apply_session_plans(&migrator, &input, &destination)?;
         assert_eq!(backups.len(), 2);
         for id in ["one", "two"] {
             assert_eq!(migrator.resolve_session(id)?.cwd, input.destination);
@@ -1920,7 +2056,8 @@ mod tests {
         input.session_ids = vec!["s2".to_owned()];
         input.destination = PathBuf::from("/example/opencode-target");
         let (destination, plans) = create_plans(&migrator, &input)?;
-        let backups = apply_session_plans(&migrator, &input, &destination, &plans)?;
+        assert_eq!(plans.len(), input.session_ids.len());
+        let backups = apply_session_plans(&migrator, &input, &destination)?;
         assert_eq!(backups.len(), 1);
         assert_eq!(
             migrator.resolve_opencode_session("s2")?.cwd,
@@ -1936,8 +2073,18 @@ mod tests {
         );
 
         input.session_ids = vec!["s1".to_owned(), "s2".to_owned()];
+        input.destination = PathBuf::from("/example/opencode-batch-target");
+        let (destination, plans) = create_plans(&migrator, &input)?;
+        assert_eq!(plans.len(), 2);
+        assert_eq!(
+            apply_session_plans(&migrator, &input, &destination)?.len(),
+            2
+        );
+        for id in ["s1", "s2"] {
+            assert_eq!(migrator.resolve_opencode_session(id)?.cwd, destination);
+        }
+        input.session_ids.clear();
         assert!(create_plans(&migrator, &input).is_err());
-        assert!(apply_session_plans(&migrator, &input, &destination, &plans).is_err());
         Ok(())
     }
 }

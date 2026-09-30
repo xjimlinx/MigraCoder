@@ -150,6 +150,12 @@ pub struct SessionInfo {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionStore {
+    Codex,
+    Opencode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionAction {
     Archive,
     Unarchive,
@@ -168,6 +174,7 @@ impl SessionAction {
 
 #[derive(Debug)]
 pub struct SessionActionPlan {
+    pub store: SessionStore,
     pub session: SessionInfo,
     pub action: SessionAction,
     pub rollout_source: Option<PathBuf>,
@@ -545,6 +552,31 @@ impl Migrator {
         Ok((session, plan))
     }
 
+    pub fn plan_opencode_session_action(
+        &self,
+        reference: &str,
+        action: SessionAction,
+    ) -> Result<SessionActionPlan> {
+        let session = self.resolve_opencode_session(reference)?;
+        match action {
+            SessionAction::Archive if session.archived => bail!("session is already archived"),
+            SessionAction::Unarchive if !session.archived => bail!("session is not archived"),
+            _ => {}
+        }
+        let path = self
+            .opencode_database()
+            .ok_or_else(|| anyhow!("opencode database not found"))?;
+        Ok(SessionActionPlan {
+            store: SessionStore::Opencode,
+            session,
+            action,
+            rollout_source: None,
+            rollout_destination: None,
+            index_change: None,
+            database_paths: vec![path],
+        })
+    }
+
     fn plan_opencode_session_rows(&self, plan: &mut Plan, session_id: &str) -> Result<()> {
         let Some(path) = self.opencode_database() else {
             return Ok(());
@@ -819,6 +851,7 @@ impl Migrator {
             bail!("no writable Codex data was found for this session");
         }
         Ok(SessionActionPlan {
+            store: SessionStore::Codex,
             session,
             action,
             rollout_source,
@@ -848,6 +881,10 @@ impl Migrator {
             }
 
             for path in &plan.database_paths {
+                if plan.store == SessionStore::Opencode {
+                    apply_opencode_session_action(path, &plan.session.session_id, plan.action)?;
+                    continue;
+                }
                 match plan.action {
                     SessionAction::Archive | SessionAction::Unarchive => {
                         update_session_archive_database(
@@ -894,12 +931,18 @@ impl Migrator {
     pub fn apply_session_actions(&self, plans: &[SessionActionPlan]) -> Result<Vec<PathBuf>> {
         let mut completed: Vec<(SessionActionPlan, PathBuf)> = Vec::new();
         for plan in plans {
-            let result = self
-                .plan_session_action(&plan.session.session_id, plan.action)
-                .and_then(|effective| {
-                    self.apply_session_action(&effective)
-                        .map(|backup| (effective, backup))
-                });
+            let effective = match plan.store {
+                SessionStore::Codex => {
+                    self.plan_session_action(&plan.session.session_id, plan.action)
+                }
+                SessionStore::Opencode => {
+                    self.plan_opencode_session_action(&plan.session.session_id, plan.action)
+                }
+            };
+            let result = effective.and_then(|effective| {
+                self.apply_session_action(&effective)
+                    .map(|backup| (effective, backup))
+            });
             match result {
                 Ok(completed_action) => completed.push(completed_action),
                 Err(original) => {
@@ -1029,12 +1072,32 @@ impl Migrator {
         references: &[String],
         new: impl AsRef<Path>,
     ) -> Result<Vec<PathBuf>> {
+        self.apply_repoints(references, new, SessionStore::Codex)
+    }
+
+    pub fn apply_opencode_session_repoints(
+        &self,
+        references: &[String],
+        new: impl AsRef<Path>,
+    ) -> Result<Vec<PathBuf>> {
+        self.apply_repoints(references, new, SessionStore::Opencode)
+    }
+
+    fn apply_repoints(
+        &self,
+        references: &[String],
+        new: impl AsRef<Path>,
+        store: SessionStore,
+    ) -> Result<Vec<PathBuf>> {
         let new = normalize_path(new)?;
         let mut backups = Vec::new();
         for reference in references {
-            let result = self
-                .plan_session(reference, &new)
-                .and_then(|(_, plan)| self.apply(&plan));
+            // Replan each item: sessions can share database files and indexes.
+            let plan = match store {
+                SessionStore::Codex => self.plan_session(reference, &new),
+                SessionStore::Opencode => self.plan_opencode_session(reference, &new),
+            };
+            let result = plan.and_then(|(_, plan)| self.apply(&plan));
             match result {
                 Ok(Some(backup)) => backups.push(backup),
                 Ok(None) => {}
@@ -1219,6 +1282,10 @@ impl Migrator {
                     SessionAction::Delete => "delete-session",
                 },
                 "session_id": plan.session.session_id,
+                "store": match plan.store {
+                    SessionStore::Codex => "codex",
+                    SessionStore::Opencode => "opencode",
+                },
                 "title": plan.session.title,
             }),
         )
@@ -2609,6 +2676,90 @@ fn update_session_archive_database(
     Ok(())
 }
 
+fn apply_opencode_session_action(
+    path: &Path,
+    session_id: &str,
+    action: SessionAction,
+) -> Result<()> {
+    let mut connection = Connection::open(path)?;
+    connection.busy_timeout(std::time::Duration::from_secs(10))?;
+    connection.pragma_update(None, "foreign_keys", true)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    match action {
+        SessionAction::Archive | SessionAction::Unarchive => {
+            let archived =
+                (action == SessionAction::Archive).then(|| Utc::now().timestamp_millis());
+            let changed = transaction.execute(
+                "UPDATE session SET time_archived = ?1 WHERE id = ?2",
+                params![archived, session_id],
+            )?;
+            if changed != 1 {
+                bail!("opencode session no longer exists: {session_id}");
+            }
+        }
+        SessionAction::Delete => {
+            let tables = table_names(&transaction)?;
+            // Also handle older schemas without cascading foreign keys.
+            if tables.contains("part") && tables.contains("message") {
+                transaction.execute(
+                    "DELETE FROM part WHERE message_id IN (SELECT id FROM message WHERE session_id = ?1)",
+                    [session_id],
+                )?;
+            }
+            for table in ["part", "message"] {
+                if tables.contains(table) && has_column(&transaction, table, "session_id")? {
+                    transaction.execute(
+                        &format!(
+                            "DELETE FROM {} WHERE session_id = ?1",
+                            quoted_identifier(table)
+                        ),
+                        [session_id],
+                    )?;
+                }
+            }
+            for table in &tables {
+                if table != "session"
+                    && table != "part"
+                    && table != "message"
+                    && has_column(&transaction, table, "session_id")?
+                {
+                    transaction.execute(
+                        &format!(
+                            "DELETE FROM {} WHERE session_id = ?1",
+                            quoted_identifier(table)
+                        ),
+                        [session_id],
+                    )?;
+                }
+            }
+            for table in ["event", "event_sequence"] {
+                if tables.contains(table) && has_column(&transaction, table, "aggregate_id")? {
+                    transaction.execute(
+                        &format!(
+                            "DELETE FROM {} WHERE aggregate_id = ?1",
+                            quoted_identifier(table)
+                        ),
+                        [session_id],
+                    )?;
+                }
+            }
+            // Keep unselected forked sessions usable after removing their parent.
+            if has_column(&transaction, "session", "parent_id")? {
+                transaction.execute(
+                    "UPDATE session SET parent_id = NULL WHERE parent_id = ?1",
+                    [session_id],
+                )?;
+            }
+            if transaction.execute("DELETE FROM session WHERE id = ?1", [session_id])? != 1 {
+                bail!("opencode session no longer exists: {session_id}");
+            }
+        }
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 fn delete_session_database_rows(path: &Path, session_id: &str) -> Result<()> {
     let mut connection = Connection::open(path)?;
     let tables = table_names(&connection)?;
@@ -3259,6 +3410,168 @@ mod tests {
             r#"INSERT INTO part VALUES ('p2', 'm2', 's1', 2, '{"type":"text","text":"ok"}')"#,
             [],
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn opencode_batch_operations_roll_back_and_preserve_other_sessions() -> Result<()> {
+        let (temporary, migrator, _) = create_fixture()?;
+        let opencode_home = temporary.path().join("opencode");
+        create_opencode_fixture(&opencode_home)?;
+        let migrator = migrator.with_opencode(Some(opencode_home.clone()))?;
+        let database_path = opencode_home.join("opencode.db");
+        let codex_database_path = migrator.state_databases()?.into_iter().next().unwrap();
+        let codex_before = fs::read(&codex_database_path)?;
+        let references = vec!["s1".to_owned(), "s2".to_owned()];
+        // Force a failure after the first session has already been changed.
+        let database = Connection::open(&database_path)?;
+        database.execute_batch("CREATE TRIGGER reject_second BEFORE UPDATE OF directory ON session WHEN NEW.id = 's2' BEGIN SELECT RAISE(ABORT, 'test failure'); END;")?;
+        assert!(
+            migrator
+                .apply_opencode_session_repoints(&references, "/example/new")
+                .is_err()
+        );
+        assert_eq!(
+            migrator.resolve_opencode_session("s1")?.cwd,
+            Path::new("/example/old-repo/sub")
+        );
+        assert_eq!(
+            migrator.resolve_opencode_session("s2")?.cwd,
+            Path::new("/example/old-repo")
+        );
+        database.execute_batch("DROP TRIGGER reject_second;")?;
+        assert_eq!(
+            migrator
+                .apply_opencode_session_repoints(&references, "/example/new")?
+                .len(),
+            2
+        );
+        for id in &references {
+            assert_eq!(
+                migrator.resolve_opencode_session(id)?.cwd,
+                Path::new("/example/new")
+            );
+        }
+        let duplicate = vec![
+            migrator.plan_opencode_session_action("s1", SessionAction::Archive)?,
+            migrator.plan_opencode_session_action("s1", SessionAction::Archive)?,
+        ];
+        assert!(migrator.apply_session_actions(&duplicate).is_err());
+        assert!(!migrator.resolve_opencode_session("s1")?.archived);
+        for action in [SessionAction::Archive, SessionAction::Unarchive] {
+            let plans = references
+                .iter()
+                .map(|id| migrator.plan_opencode_session_action(id, action))
+                .collect::<Result<Vec<_>>>()?;
+            let backups = migrator.apply_session_actions(&plans)?;
+            assert_eq!(backups.len(), 2);
+            assert!(
+                backups
+                    .iter()
+                    .all(|backup| backup.join("opencode/opencode.db").is_file())
+            );
+            for id in &references {
+                assert_eq!(
+                    migrator.resolve_opencode_session(id)?.archived,
+                    action == SessionAction::Archive
+                );
+            }
+        }
+        database.execute_batch("CREATE TRIGGER reject_delete BEFORE DELETE ON session WHEN OLD.id = 's2' BEGIN SELECT RAISE(ABORT, 'test failure'); END;")?;
+        let plans = references
+            .iter()
+            .map(|id| migrator.plan_opencode_session_action(id, SessionAction::Delete))
+            .collect::<Result<Vec<_>>>()?;
+        assert!(migrator.apply_session_actions(&plans).is_err());
+        assert_eq!(migrator.list_opencode_sessions(None)?.len(), 2);
+        assert_eq!(
+            migrator
+                .opencode_session_preview("s1", 5, None)?
+                .messages
+                .len(),
+            1
+        );
+        database.execute_batch("DROP TRIGGER reject_delete;")?;
+        // Delete just one session; all of the other session's events remain.
+        let plan = migrator.plan_opencode_session_action("s1", SessionAction::Delete)?;
+        let backups = migrator.apply_session_actions(&[plan])?;
+        assert_eq!(migrator.list_opencode_sessions(None)?.len(), 1);
+        for table in ["message", "part"] {
+            let count: i64 =
+                database.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })?;
+            assert_eq!(count, 0);
+        }
+        let events: i64 = database.query_row("SELECT COUNT(*) FROM event", [], |row| row.get(0))?;
+        assert_eq!(events, 1);
+        assert!(migrator.resolve_opencode_session("s2").is_ok());
+        migrator.restore_backup(&backups[0])?;
+        assert_eq!(
+            migrator
+                .opencode_session_preview("s1", 5, None)?
+                .messages
+                .len(),
+            1
+        );
+        assert_eq!(fs::read(&codex_database_path)?, codex_before);
+        Ok(())
+    }
+
+    #[test]
+    fn opencode_delete_handles_foreign_keys_and_retains_unselected_children() -> Result<()> {
+        let (temporary, migrator, _) = create_fixture()?;
+        let opencode_home = temporary.path().join("opencode");
+        fs::create_dir(&opencode_home)?;
+        let database = Connection::open(opencode_home.join("opencode.db"))?;
+        database.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, title TEXT, slug TEXT, time_updated INTEGER, time_archived INTEGER);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT REFERENCES session(id) ON DELETE CASCADE, time_created INTEGER, data TEXT);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT REFERENCES message(id) ON DELETE CASCADE, session_id TEXT, time_created INTEGER, data TEXT);
+             CREATE TABLE todo (session_id TEXT REFERENCES session(id) ON DELETE CASCADE, content TEXT);
+             CREATE TABLE session_input (session_id TEXT REFERENCES session(id) ON DELETE CASCADE, prompt TEXT);
+             CREATE TABLE event_sequence (aggregate_id TEXT PRIMARY KEY, seq INTEGER);
+             CREATE TABLE event (id TEXT PRIMARY KEY, aggregate_id TEXT REFERENCES event_sequence(aggregate_id) ON DELETE CASCADE, data TEXT);
+             INSERT INTO session VALUES ('parent', NULL, '/example/old', 'Parent', 'parent', 1, NULL), ('child', 'parent', '/example/old', 'Child', 'child', 2, NULL);
+             INSERT INTO message VALUES ('m1', 'parent', 1, '{}'), ('m2', 'child', 2, '{}');
+             INSERT INTO part VALUES ('p1', 'm1', 'parent', 1, '{}'), ('p2', 'm2', 'child', 2, '{}');
+             INSERT INTO todo VALUES ('parent', 'one'), ('child', 'two');
+             INSERT INTO session_input VALUES ('parent', 'one'), ('child', 'two');
+             INSERT INTO event_sequence VALUES ('parent', 1), ('child', 1);
+             INSERT INTO event VALUES ('e1', 'parent', '{}'), ('e2', 'child', '{}');"
+        )?;
+        let migrator = migrator.with_opencode(Some(opencode_home))?;
+        let plan = migrator.plan_opencode_session_action("parent", SessionAction::Delete)?;
+        migrator.apply_session_actions(&[plan])?;
+        for table in [
+            "session",
+            "message",
+            "part",
+            "todo",
+            "session_input",
+            "event_sequence",
+            "event",
+        ] {
+            let count: i64 =
+                database.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })?;
+            assert_eq!(count, 1, "unexpected count in {table}");
+        }
+        let parent: Option<String> = database.query_row(
+            "SELECT parent_id FROM session WHERE id = 'child'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(parent.is_none());
+        assert!(
+            database
+                .prepare("PRAGMA foreign_key_check")?
+                .query([])?
+                .next()?
+                .is_none()
+        );
         Ok(())
     }
 
