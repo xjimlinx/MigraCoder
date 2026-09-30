@@ -1,6 +1,6 @@
 [package]
 name = "migracoder"
-version = "0.10.0"
+version = "0.13.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Move a workspace and repoint local Codex sessions to its new path"

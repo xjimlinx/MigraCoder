@@ -37,12 +37,14 @@ make gui
 
 界面提供两种流程：
 
-- **单个会话**：顶部可在 **Codex** / **opencode** 两个标签间切换，分别浏览各自的会话。默认浏览全部工作区，可按标题、路径、会话 ID 或正文（opencode 为 slug）搜索；会话以固定表头的表格展示话题标题、工作目录、更新时间、状态和操作。单击一行选择，双击标题或按“查看”打开摘要窗口，点选后会自动带入源路径。opencode 标签的会话可查看内容、复制 `opencode --session` 命令，并可单独修复该会话的指向。
-- **整个工作区**：选择源目录和目标位置，可选择移动磁盘目录，或只修复 Codex 指向。
+- **会话管理**：顶部可在 **Codex** / **opencode** 两个标签间切换，分别浏览各自的会话。Codex 会话可多选并批量重定向工作目录、归档、取消归档或删除，也可分页阅读单条会话。opencode 会话可查看内容、复制 `opencode --session` 命令，并单独修复工作目录指向。
+- **整个工作区**：选择源目录和目标位置，可选择移动磁盘目录，或只修复 Codex 与 opencode 指向。
 
 扫描和迁移在后台执行；“检查并执行”会先生成真实变更计划，再显示确认窗口。每次真实修改仍会创建一致性备份，完成后会自动复查旧路径指向。界面可勾选是否同时处理 opencode 会话，并填写其数据目录。
 
-会话详情按需读取，最多展示首条、搜索命中和最近的用户消息摘要；还可以修改话题标题、复制会话 ID 或对应的 `codex resume` 命令，不会在主列表展开整段提示词。标题修改会同步写入 Codex 会话索引、状态数据库和桌面端标题缓存，并在修改前备份。
+Codex 会话详情同时展示用户和 AI 消息，并按 JSONL 字节游标增量读取，不会先把整个会话载入内存。默认每页 10 条、每条最多 4000 字，可在详情窗口选择 5–50 条的分页粒度和 1k–20k 字的单条上限后重新加载。系统提示、工具输出和思考过程不会展示。opencode 会话详情展示前 5–50 条用户消息摘要。
+
+Codex 详情中还可以修改话题标题、归档、取消归档、删除、复制会话 ID 或对应的 `codex resume` 命令。标题和状态修改都会同步写入 Codex 会话文件、索引及状态数据库，并在修改前备份。列表下方提供批量操作栏，危险操作会显示数量和会话清单后再次确认；批量执行中途失败时，已完成项目会逆序回滚。
 
 安装 GUI、独立的 `migracoder-gui` 命令和桌面启动项：
 
@@ -71,6 +73,15 @@ make install-all
 ./migracoder sessions --search "database migration"
 ```
 
+在终端中分页阅读用户和 AI 消息：
+
+```bash
+./migracoder show-session <会话ID>
+./migracoder show-session <会话ID> --limit 20 --max-chars 10000
+```
+
+如果还有下一页，命令末尾会输出包含 `--offset` 游标的下一页命令。每次只保留当前页内容。
+
 可以按标题和用户消息正文过滤；只有加上 `--recursive` 才会包含子目录：
 
 ```bash
@@ -93,6 +104,26 @@ make install-all
 ./migracoder rename-session <会话ID> "新的话题标题" --dry-run
 ./migracoder rename-session <会话ID> "新的话题标题"
 ```
+
+归档单个会话，或将它恢复到活动列表：
+
+```bash
+./migracoder archive-session <会话ID> --dry-run
+./migracoder archive-session <会话ID>
+./migracoder unarchive-session <会话ID>
+```
+
+删除前可以先预览。正式删除会交互确认；脚本或其他非交互环境必须显式传入
+`--yes`。操作会先备份 rollout、会话索引和包含关联记录的数据库：
+
+```bash
+./migracoder delete-session <会话ID> --dry-run
+./migracoder delete-session <会话ID>
+./migracoder delete-session <会话ID> --yes
+```
+
+这些命令只处理指定会话，不会归档或删除同一目录下的其他会话。执行时建议关闭
+Codex 客户端，避免它同时写入本地状态。
 
 ## 直接运行
 

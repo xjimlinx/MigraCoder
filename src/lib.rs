@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use tempfile::NamedTempFile;
@@ -149,11 +149,97 @@ pub struct SessionInfo {
     pub match_excerpt: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionAction {
+    Archive,
+    Unarchive,
+    Delete,
+}
+
+impl SessionAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Archive => "归档",
+            Self::Unarchive => "取消归档",
+            Self::Delete => "删除",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SessionActionPlan {
+    pub session: SessionInfo,
+    pub action: SessionAction,
+    pub rollout_source: Option<PathBuf>,
+    pub rollout_destination: Option<PathBuf>,
+    index_change: Option<TextChange>,
+    database_paths: Vec<PathBuf>,
+}
+
+impl SessionActionPlan {
+    pub fn files(&self) -> usize {
+        usize::from(self.rollout_source.is_some())
+            + usize::from(self.index_change.is_some())
+            + self.database_paths.len()
+    }
+
+    pub fn descriptions(&self) -> Vec<String> {
+        let mut descriptions = Vec::new();
+        if let Some(source) = &self.rollout_source {
+            if let Some(destination) = &self.rollout_destination {
+                descriptions.push(format!(
+                    "move   {} -> {}",
+                    source.display(),
+                    destination.display()
+                ));
+            } else {
+                descriptions.push(format!("delete {}", source.display()));
+            }
+        }
+        if let Some(change) = &self.index_change {
+            descriptions.push(format!("index  {}", change.path.display()));
+        }
+        descriptions.extend(
+            self.database_paths
+                .iter()
+                .map(|path| format!("sqlite {}", path.display())),
+        );
+        descriptions
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MessageRole {
+    User,
+    Assistant,
+}
+
+impl MessageRole {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::User => "用户",
+            Self::Assistant => "AI",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SessionMessage {
+    pub role: MessageRole,
+    pub content: String,
+    pub truncated: bool,
+    pub timestamp: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct SessionPreview {
     pub session: SessionInfo,
-    pub user_messages: Vec<String>,
+    pub messages: Vec<SessionMessage>,
+    pub next_offset: Option<u64>,
+    pub skipped_oversized_records: usize,
 }
+
+const MAX_JSONL_RECORD_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct DoctorReport {
@@ -367,7 +453,9 @@ impl Migrator {
         let Some(path) = self.opencode_database() else {
             return Ok(SessionPreview {
                 session,
-                user_messages: Vec::new(),
+                messages: Vec::new(),
+                next_offset: None,
+                skipped_oversized_records: 0,
             });
         };
         let connection = open_read_only(&path)?;
@@ -375,7 +463,7 @@ impl Migrator {
             .prepare("SELECT id FROM message WHERE session_id = ?1 ORDER BY time_created, id")?;
         let message_rows =
             message_statement.query_map([&session.session_id], |row| row.get::<_, String>(0))?;
-        let mut user_message_ids = Vec::new();
+        let mut messages = Vec::new();
         let mut part_statement = connection
             .prepare("SELECT data FROM part WHERE message_id = ?1 ORDER BY time_created, id")?;
         for message_id in message_rows {
@@ -423,14 +511,22 @@ impl Migrator {
             {
                 continue;
             }
-            user_message_ids.push(compact_preview_text(&compact, 600));
-            if user_message_ids.len() >= limit {
+            let (content, truncated) = truncate_message_text(&compact, 600);
+            messages.push(SessionMessage {
+                role: MessageRole::User,
+                content,
+                truncated,
+                timestamp: None,
+            });
+            if messages.len() >= limit {
                 break;
             }
         }
         Ok(SessionPreview {
             session,
-            user_messages: user_message_ids,
+            messages,
+            next_offset: None,
+            skipped_oversized_records: 0,
         })
     }
 
@@ -600,61 +696,237 @@ impl Migrator {
     pub fn session_preview(
         &self,
         reference: &str,
+        offset: u64,
         max_messages: usize,
-        search: Option<&str>,
+        max_chars: usize,
     ) -> Result<SessionPreview> {
+        if !(1..=100).contains(&max_messages) {
+            bail!("page size must be between 1 and 100 messages");
+        }
+        if !(200..=50_000).contains(&max_chars) {
+            bail!("message size must be between 200 and 50000 characters");
+        }
         let session = self.resolve_session(reference)?;
         let mut messages = Vec::new();
+        let mut next_offset = None;
+        let mut skipped_oversized_records = 0;
         if let Some(path) = session
             .rollout_path
             .as_deref()
             .filter(|path| path.is_file())
         {
-            for line in BufReader::new(File::open(path)?).lines() {
-                let Ok(value) = serde_json::from_str::<Value>(&line?) else {
+            let file = File::open(path)?;
+            let file_len = file.metadata()?.len();
+            if offset > file_len {
+                bail!("message cursor is past the end of the session file");
+            }
+            let mut reader = BufReader::new(file);
+            reader.seek(SeekFrom::Start(offset))?;
+            let mut position = offset;
+            let mut line = Vec::new();
+            while messages.len() < max_messages {
+                let (bytes, oversized) =
+                    read_bounded_line(&mut reader, &mut line, MAX_JSONL_RECORD_BYTES)?;
+                if bytes == 0 {
+                    break;
+                }
+                position += bytes as u64;
+                if oversized {
+                    skipped_oversized_records += 1;
+                    continue;
+                }
+                let Ok(value) = serde_json::from_slice::<Value>(&line) else {
                     continue;
                 };
-                let text = compact_preview_text(&user_text_from_record(&value), 600);
-                if text.is_empty()
-                    || text.starts_with("<environment_context>")
-                    || messages.last() == Some(&text)
+                let Some((role, text)) = conversation_message_from_record(&value) else {
+                    continue;
+                };
+                if role == MessageRole::User
+                    && text.trim_start().starts_with("<environment_context>")
                 {
                     continue;
                 }
-                messages.push(text);
-            }
-        }
-        if max_messages == 0 {
-            messages.clear();
-        } else if messages.len() > max_messages {
-            let mut selected = HashSet::from([0]);
-            if max_messages > 1
-                && let Some(needle) = search
-                    .map(str::to_lowercase)
-                    .filter(|text| !text.is_empty())
-                && let Some(index) = messages
-                    .iter()
-                    .position(|message| message.to_lowercase().contains(&needle))
-            {
-                selected.insert(index);
-            }
-            for index in (0..messages.len()).rev() {
-                if selected.len() >= max_messages {
-                    break;
+                let (content, truncated) = truncate_message_text(&text, max_chars);
+                if content.trim().is_empty() {
+                    continue;
                 }
-                selected.insert(index);
+                messages.push(SessionMessage {
+                    role,
+                    content,
+                    truncated,
+                    timestamp: value
+                        .get("timestamp")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                });
             }
-            let mut indices = selected.into_iter().collect::<Vec<_>>();
-            indices.sort_unstable();
-            messages = indices
-                .into_iter()
-                .map(|index| messages[index].clone())
-                .collect();
+            if position < file_len {
+                next_offset = Some(position);
+            }
         }
         Ok(SessionPreview {
             session,
-            user_messages: messages,
+            messages,
+            next_offset,
+            skipped_oversized_records,
         })
+    }
+
+    pub fn plan_session_action(
+        &self,
+        reference: &str,
+        action: SessionAction,
+    ) -> Result<SessionActionPlan> {
+        let session = self.resolve_session(reference)?;
+        match action {
+            SessionAction::Archive if session.archived => bail!("session is already archived"),
+            SessionAction::Unarchive if !session.archived => bail!("session is not archived"),
+            _ => {}
+        }
+
+        let rollout_source = session.rollout_path.clone().filter(|path| path.is_file());
+        let rollout_destination = match (action, rollout_source.as_deref()) {
+            (SessionAction::Archive, Some(source)) => Some(
+                self.codex_home.join("archived_sessions").join(
+                    source
+                        .file_name()
+                        .ok_or_else(|| anyhow!("invalid rollout path"))?,
+                ),
+            ),
+            (SessionAction::Unarchive, Some(source)) => {
+                Some(self.active_rollout_path(source, session.updated_at_ms)?)
+            }
+            _ => None,
+        };
+        if let (Some(source), Some(destination)) =
+            (rollout_source.as_deref(), rollout_destination.as_deref())
+            && source != destination
+            && destination.exists()
+        {
+            bail!(
+                "rollout destination already exists: {}",
+                destination.display()
+            );
+        }
+
+        let index_change = if action == SessionAction::Delete {
+            self.plan_session_index_delete(&session.session_id)?
+        } else {
+            None
+        };
+        let database_paths = self.session_action_databases(&session.session_id, action)?;
+        if rollout_source.is_none() && index_change.is_none() && database_paths.is_empty() {
+            bail!("no writable Codex data was found for this session");
+        }
+        Ok(SessionActionPlan {
+            session,
+            action,
+            rollout_source,
+            rollout_destination,
+            index_change,
+            database_paths,
+        })
+    }
+
+    pub fn apply_session_action(&self, plan: &SessionActionPlan) -> Result<PathBuf> {
+        let backup_dir = self.create_session_action_backup(plan)?;
+        let result = (|| -> Result<()> {
+            if let (Some(source), Some(destination)) =
+                (&plan.rollout_source, &plan.rollout_destination)
+                && source != destination
+            {
+                if let Some(parent) = destination.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::rename(source, destination).with_context(|| {
+                    format!(
+                        "failed to move rollout {} -> {}",
+                        source.display(),
+                        destination.display()
+                    )
+                })?;
+            }
+
+            for path in &plan.database_paths {
+                match plan.action {
+                    SessionAction::Archive | SessionAction::Unarchive => {
+                        update_session_archive_database(
+                            path,
+                            &plan.session.session_id,
+                            plan.action == SessionAction::Archive,
+                            plan.rollout_destination.as_deref(),
+                        )?;
+                    }
+                    SessionAction::Delete => {
+                        delete_session_database_rows(path, &plan.session.session_id)?;
+                    }
+                }
+            }
+            if let Some(change) = &plan.index_change {
+                atomic_write(&change.path, change.content.as_bytes())?;
+            }
+            if plan.action == SessionAction::Delete
+                && let Some(source) = &plan.rollout_source
+                && source.exists()
+            {
+                fs::remove_file(source)?;
+            }
+            Ok(())
+        })();
+
+        if let Err(original) = result {
+            if let Some(destination) = &plan.rollout_destination
+                && destination.exists()
+            {
+                let _ = fs::remove_file(destination);
+            }
+            if let Err(restore) = self.restore_backup(&backup_dir) {
+                return Err(anyhow!(
+                    "{} failed: {original:#}; backup restore also failed: {restore:#}",
+                    plan.action.label()
+                ));
+            }
+            return Err(original);
+        }
+        Ok(backup_dir)
+    }
+
+    pub fn apply_session_actions(&self, plans: &[SessionActionPlan]) -> Result<Vec<PathBuf>> {
+        let mut completed: Vec<(SessionActionPlan, PathBuf)> = Vec::new();
+        for plan in plans {
+            let result = self
+                .plan_session_action(&plan.session.session_id, plan.action)
+                .and_then(|effective| {
+                    self.apply_session_action(&effective)
+                        .map(|backup| (effective, backup))
+                });
+            match result {
+                Ok(completed_action) => completed.push(completed_action),
+                Err(original) => {
+                    let mut restore_errors = Vec::new();
+                    for (completed_plan, backup) in completed.iter().rev() {
+                        if let Some(destination) = &completed_plan.rollout_destination
+                            && destination.exists()
+                            && let Err(error) = fs::remove_file(destination)
+                        {
+                            restore_errors
+                                .push(format!("cannot remove {}: {error}", destination.display()));
+                        }
+                        if let Err(error) = self.restore_backup(backup) {
+                            restore_errors.push(format!("{}: {error:#}", backup.display()));
+                        }
+                    }
+                    if restore_errors.is_empty() {
+                        return Err(original);
+                    }
+                    return Err(anyhow!(
+                        "batch session operation failed: {original:#}; rollback also failed: {}",
+                        restore_errors.join("; ")
+                    ));
+                }
+            }
+        }
+        Ok(completed.into_iter().map(|(_, backup)| backup).collect())
     }
 
     pub fn plan_session(
@@ -752,6 +1024,40 @@ impl Migrator {
         Ok(Some(backup_dir))
     }
 
+    pub fn apply_session_repoints(
+        &self,
+        references: &[String],
+        new: impl AsRef<Path>,
+    ) -> Result<Vec<PathBuf>> {
+        let new = normalize_path(new)?;
+        let mut backups = Vec::new();
+        for reference in references {
+            let result = self
+                .plan_session(reference, &new)
+                .and_then(|(_, plan)| self.apply(&plan));
+            match result {
+                Ok(Some(backup)) => backups.push(backup),
+                Ok(None) => {}
+                Err(original) => {
+                    let mut restore_errors = Vec::new();
+                    for backup in backups.iter().rev() {
+                        if let Err(error) = self.restore_backup(backup) {
+                            restore_errors.push(format!("{}: {error:#}", backup.display()));
+                        }
+                    }
+                    if restore_errors.is_empty() {
+                        return Err(original);
+                    }
+                    return Err(anyhow!(
+                        "batch migration failed: {original:#}; rollback also failed: {}",
+                        restore_errors.join("; ")
+                    ));
+                }
+            }
+        }
+        Ok(backups)
+    }
+
     pub fn apply_session_title(&self, plan: &TitlePlan) -> Result<Option<PathBuf>> {
         if plan.files() == 0 {
             return Ok(None);
@@ -782,6 +1088,140 @@ impl Migrator {
             self.codex_home.join("sessions"),
             self.codex_home.join("archived_sessions"),
         ]
+    }
+
+    fn active_rollout_path(&self, source: &Path, updated_at_ms: i64) -> Result<PathBuf> {
+        let file_name = source
+            .file_name()
+            .ok_or_else(|| anyhow!("invalid rollout path"))?;
+        let name = file_name.to_string_lossy();
+        let date = name
+            .strip_prefix("rollout-")
+            .and_then(|rest| rest.get(..10))
+            .filter(|date| {
+                date.as_bytes().get(4) == Some(&b'-')
+                    && date.as_bytes().get(7) == Some(&b'-')
+                    && date
+                        .chars()
+                        .enumerate()
+                        .all(|(index, ch)| index == 4 || index == 7 || ch.is_ascii_digit())
+            })
+            .map(str::to_owned)
+            .or_else(|| {
+                DateTime::<Utc>::from_timestamp_millis(updated_at_ms)
+                    .map(|time| time.format("%Y-%m-%d").to_string())
+            })
+            .ok_or_else(|| anyhow!("cannot determine rollout date"))?;
+        Ok(self
+            .codex_home
+            .join("sessions")
+            .join(&date[0..4])
+            .join(&date[5..7])
+            .join(&date[8..10])
+            .join(file_name))
+    }
+
+    fn plan_session_index_delete(&self, session_id: &str) -> Result<Option<TextChange>> {
+        let path = self.codex_home.join("session_index.jsonl");
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let original = fs::read_to_string(&path)?;
+        let trailing_newline = original.ends_with('\n');
+        let mut removed = 0;
+        let lines = original
+            .lines()
+            .filter(|line| {
+                let matches = serde_json::from_str::<Value>(line)
+                    .ok()
+                    .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_owned))
+                    .as_deref()
+                    == Some(session_id);
+                removed += usize::from(matches);
+                !matches
+            })
+            .collect::<Vec<_>>();
+        if removed == 0 {
+            return Ok(None);
+        }
+        let mut content = lines.join("\n");
+        if trailing_newline && !content.is_empty() {
+            content.push('\n');
+        }
+        Ok(Some(TextChange {
+            path,
+            content,
+            replacements: removed,
+        }))
+    }
+
+    fn session_action_databases(
+        &self,
+        session_id: &str,
+        action: SessionAction,
+    ) -> Result<Vec<PathBuf>> {
+        let mut matches = Vec::new();
+        for path in self.all_databases()? {
+            let connection = open_read_only(&path)?;
+            let tables = table_names(&connection)?;
+            let affected = if action == SessionAction::Delete {
+                database_contains_session(&connection, &tables, session_id)?
+            } else if tables.contains("threads")
+                && has_column(&connection, "threads", "id")?
+                && has_column(&connection, "threads", "archived")?
+            {
+                connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM threads WHERE id=?1)",
+                    [session_id],
+                    |row| row.get::<_, bool>(0),
+                )?
+            } else {
+                false
+            };
+            if affected {
+                matches.push(path);
+            }
+        }
+        Ok(matches)
+    }
+
+    fn create_session_action_backup(&self, plan: &SessionActionPlan) -> Result<PathBuf> {
+        let mut text_changes = Vec::new();
+        if let Some(path) = &plan.rollout_source {
+            text_changes.push(TextChange {
+                path: path.clone(),
+                content: String::new(),
+                replacements: 1,
+            });
+        }
+        if let Some(change) = &plan.index_change {
+            text_changes.push(TextChange {
+                path: change.path.clone(),
+                content: String::new(),
+                replacements: change.replacements,
+            });
+        }
+        let database_changes = plan
+            .database_paths
+            .iter()
+            .map(|path| DatabaseChange {
+                path: path.clone(),
+                updates: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        self.create_backup_for_changes(
+            &text_changes,
+            &database_changes,
+            json!({
+                "operation": match plan.action {
+                    SessionAction::Archive => "archive-session",
+                    SessionAction::Unarchive => "unarchive-session",
+                    SessionAction::Delete => "delete-session",
+                },
+                "session_id": plan.session.session_id,
+                "title": plan.session.title,
+            }),
+        )
     }
 
     fn state_databases(&self) -> Result<Vec<PathBuf>> {
@@ -1389,7 +1829,11 @@ impl Migrator {
                     continue;
                 };
                 if let Some(session) = sessions.get_mut(&id) {
-                    if session.rollout_path.is_none() {
+                    if session
+                        .rollout_path
+                        .as_ref()
+                        .is_none_or(|rollout| !rollout.is_file())
+                    {
                         session.rollout_path = Some(path.to_path_buf());
                     }
                     continue;
@@ -1467,10 +1911,15 @@ impl Migrator {
             let Ok(value) = serde_json::from_str::<Value>(&line?) else {
                 continue;
             };
-            let text = user_text_from_record(&value);
+            let (role, text) = conversation_message_from_record(&value)
+                .map(|(role, text)| (Some(role), text))
+                .unwrap_or_else(|| (None, user_text_from_record(&value)));
             if text.to_lowercase().contains(&needle) {
-                let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                return Ok(Some(compact.chars().take(180).collect()));
+                let excerpt = compact_excerpt(&text, 180);
+                return Ok(Some(match role {
+                    Some(role) => format!("{}：{excerpt}", role.label()),
+                    None => excerpt,
+                }));
             }
         }
         Ok(None)
@@ -1575,6 +2024,9 @@ impl Migrator {
                 .source
                 .clone()
                 .unwrap_or_else(|| self.codex_home.join(&item.path));
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
             if item.kind == "sqlite" {
                 restore_database(&source, &destination)?;
             } else {
@@ -1919,15 +2371,109 @@ fn user_text_from_record(record: &Value) -> String {
     }
 }
 
-fn compact_preview_text(text: &str, max_chars: usize) -> String {
-    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut characters = compact.chars();
+fn conversation_message_from_record(record: &Value) -> Option<(MessageRole, String)> {
+    if record.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return None;
+    }
+    let payload = record.get("payload")?.as_object()?;
+    let (role, content) = match payload.get("type").and_then(Value::as_str) {
+        Some("item_completed") => {
+            let item = payload.get("item")?.as_object()?;
+            let role = match item.get("type").and_then(Value::as_str) {
+                Some("UserMessage") => MessageRole::User,
+                Some("AgentMessage") => MessageRole::Assistant,
+                _ => return None,
+            };
+            (role, item.get("content")?)
+        }
+        Some("user_message") => (MessageRole::User, payload.get("message")?),
+        Some("agent_message") => (MessageRole::Assistant, payload.get("message")?),
+        _ => return None,
+    };
+    let text = text_from_message_content(content);
+    (!text.trim().is_empty()).then_some((role, text))
+}
+
+fn read_bounded_line(
+    reader: &mut impl BufRead,
+    output: &mut Vec<u8>,
+    max_bytes: usize,
+) -> std::io::Result<(usize, bool)> {
+    output.clear();
+    let mut total = 0;
+    let mut oversized = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok((total, oversized));
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        if !oversized && output.len() + consumed <= max_bytes {
+            output.extend_from_slice(&available[..consumed]);
+        } else {
+            oversized = true;
+            output.clear();
+        }
+        reader.consume(consumed);
+        total += consumed;
+        if newline.is_some() {
+            return Ok((total, oversized));
+        }
+    }
+}
+
+fn text_from_message_content(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| {
+                item.get("text")
+                    .or_else(|| item.get("content"))
+                    .and_then(Value::as_str)
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn truncate_message_text(text: &str, max_chars: usize) -> (String, bool) {
+    let mut characters = text.trim().chars();
     let shortened = characters.by_ref().take(max_chars).collect::<String>();
     if characters.next().is_some() {
-        format!("{shortened}…")
+        (format!("{shortened}\n\n…（该消息过长，已截断）"), true)
     } else {
-        shortened
+        (shortened, false)
     }
+}
+
+fn compact_excerpt(text: &str, max_chars: usize) -> String {
+    let mut result = String::new();
+    let mut previous_was_space = true;
+    let mut count = 0;
+    let mut truncated = false;
+    for character in text.chars() {
+        if character.is_whitespace() {
+            if !previous_was_space && count < max_chars {
+                result.push(' ');
+                count += 1;
+            }
+            previous_was_space = true;
+        } else if count < max_chars {
+            result.push(character);
+            count += 1;
+            previous_was_space = false;
+        } else {
+            truncated = true;
+            break;
+        }
+    }
+    if truncated {
+        result.push('…');
+    }
+    result.trim_end().to_owned()
 }
 
 fn read_session_metadata(path: &Path) -> Result<Option<(String, PathBuf, i64)>> {
@@ -1971,7 +2517,7 @@ fn table_names(connection: &Connection) -> Result<HashSet<String>> {
 }
 
 fn columns(connection: &Connection, table: &str) -> Result<HashSet<String>> {
-    let query = format!("PRAGMA table_info(\"{table}\")");
+    let query = format!("PRAGMA table_info({})", quoted_identifier(table));
     let mut statement = connection.prepare(&query)?;
     let rows = statement.query_map([], |row| row.get(1))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1979,6 +2525,116 @@ fn columns(connection: &Connection, table: &str) -> Result<HashSet<String>> {
 
 fn has_column(connection: &Connection, table: &str, column: &str) -> Result<bool> {
     Ok(columns(connection, table)?.contains(column))
+}
+
+fn session_identity_columns(table: &str, columns: &HashSet<String>) -> Vec<&'static str> {
+    let mut result = Vec::new();
+    if table == "threads" && columns.contains("id") {
+        result.push("id");
+    }
+    for column in ["thread_id", "parent_thread_id", "child_thread_id"] {
+        if columns.contains(column) {
+            result.push(column);
+        }
+    }
+    result
+}
+
+fn quoted_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn database_contains_session(
+    connection: &Connection,
+    tables: &HashSet<String>,
+    session_id: &str,
+) -> Result<bool> {
+    for table in tables {
+        let columns = columns(connection, table)?;
+        let identities = session_identity_columns(table, &columns);
+        if identities.is_empty() {
+            continue;
+        }
+        let predicates = identities
+            .iter()
+            .map(|column| format!("{} = ?", quoted_identifier(column)))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let query = format!(
+            "SELECT EXISTS(SELECT 1 FROM {} WHERE {predicates})",
+            quoted_identifier(table)
+        );
+        let parameters = std::iter::repeat_n(session_id, identities.len());
+        if connection.query_row(&query, rusqlite::params_from_iter(parameters), |row| {
+            row.get::<_, bool>(0)
+        })? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn update_session_archive_database(
+    path: &Path,
+    session_id: &str,
+    archived: bool,
+    rollout_path: Option<&Path>,
+) -> Result<()> {
+    let mut connection = Connection::open(path)?;
+    let columns = columns(&connection, "threads")?;
+    if !columns.contains("id") || !columns.contains("archived") {
+        return Ok(());
+    }
+    let mut assignments = vec!["archived = ?".to_owned()];
+    let mut values = vec![SqlValue::Integer(i64::from(archived))];
+    if columns.contains("archived_at") {
+        assignments.push("archived_at = ?".to_owned());
+        values.push(if archived {
+            SqlValue::Integer(Utc::now().timestamp())
+        } else {
+            SqlValue::Null
+        });
+    }
+    if columns.contains("rollout_path")
+        && let Some(rollout_path) = rollout_path
+    {
+        assignments.push("rollout_path = ?".to_owned());
+        values.push(SqlValue::Text(path_string(rollout_path)));
+    }
+    values.push(SqlValue::Text(session_id.to_owned()));
+    let query = format!("UPDATE threads SET {} WHERE id = ?", assignments.join(", "));
+    let transaction = connection.transaction()?;
+    transaction.execute(&query, rusqlite::params_from_iter(values))?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn delete_session_database_rows(path: &Path, session_id: &str) -> Result<()> {
+    let mut connection = Connection::open(path)?;
+    let tables = table_names(&connection)?;
+    let mut ordered = tables.into_iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|table| table == "threads");
+    let transaction = connection.transaction()?;
+    for table in ordered {
+        let columns = columns(&transaction, &table)?;
+        let identities = session_identity_columns(&table, &columns);
+        if identities.is_empty() {
+            continue;
+        }
+        let predicates = identities
+            .iter()
+            .map(|column| format!("{} = ?", quoted_identifier(column)))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let query = format!(
+            "DELETE FROM {} WHERE {predicates}",
+            quoted_identifier(&table)
+        );
+        let parameters = std::iter::repeat_n(session_id, identities.len());
+        transaction.execute(&query, rusqlite::params_from_iter(parameters))?;
+    }
+    transaction.commit()?;
+    Ok(())
 }
 
 fn apply_database(change: &DatabaseChange) -> Result<()> {
@@ -2093,7 +2749,7 @@ pub fn rollback_workspace_move(old: &Path, new: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn create_fixture() -> Result<(tempfile::TempDir, Migrator, PathBuf)> {
+    pub(super) fn create_fixture() -> Result<(tempfile::TempDir, Migrator, PathBuf)> {
         let temporary = tempfile::tempdir()?;
         let codex_home = temporary.path().join(".codex");
         let session_dir = codex_home.join("sessions/2026/01/02");
@@ -2108,7 +2764,8 @@ mod tests {
         )?;
         fs::write(
             codex_home.join("session_index.jsonl"),
-            "{\"id\":\"one\",\"thread_name\":\"Fixture session\",\"updated_at\":\"2026-01-02T00:00:00Z\"}\n",
+            "{\"id\":\"one\",\"thread_name\":\"Fixture session\",\"updated_at\":\"2026-01-02T00:00:00Z\"}\n\
+             {\"id\":\"two\",\"thread_name\":\"Other work\",\"updated_at\":\"2026-01-02T00:00:00Z\"}\n",
         )?;
         let session_path = session_dir.join("rollout.jsonl");
         let records = [
@@ -2116,6 +2773,7 @@ mod tests {
             json!({"type":"turn_context","payload":{"cwd":"/example/old-repo","workspace_roots":["/example/old-repo"]}}),
             json!({"type":"response_item","payload":{"text":"/example/old-repo"}}),
             json!({"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","content":[{"type":"text","text":"repair the sample database"}]}}}),
+            json!({"timestamp":"2026-01-02T00:00:01Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","content":[{"type":"text","text":"I can help repair that database."}]}}}),
         ];
         let rollout = records
             .iter()
@@ -2130,11 +2788,16 @@ mod tests {
             "CREATE TABLE threads (
                 id TEXT PRIMARY KEY, cwd TEXT NOT NULL, title TEXT NOT NULL,
                 rollout_path TEXT NOT NULL, updated_at_ms INTEGER NOT NULL, archived INTEGER NOT NULL,
-                sandbox_policy TEXT NOT NULL, name TEXT
+                archived_at INTEGER, sandbox_policy TEXT NOT NULL, name TEXT
+             );
+             CREATE TABLE thread_artifacts (
+                id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, payload TEXT NOT NULL
              );",
         )?;
         state.execute(
-            "INSERT INTO threads VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO threads
+             (id, cwd, title, rollout_path, updated_at_ms, archived, sandbox_policy, name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 "one",
                 "/example/old-repo",
@@ -2147,7 +2810,9 @@ mod tests {
             ],
         )?;
         state.execute(
-            "INSERT INTO threads VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO threads
+             (id, cwd, title, rollout_path, updated_at_ms, archived, sandbox_policy, name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 "two",
                 "/example/old-repo",
@@ -2158,6 +2823,10 @@ mod tests {
                 r#"{"type":"workspace-write","writable_roots":["/example/old-repo"]}"#,
                 "Other work"
             ],
+        )?;
+        state.execute(
+            "INSERT INTO thread_artifacts VALUES ('artifact-one', 'one', 'saved')",
+            [],
         )?;
         drop(state);
 
@@ -2205,6 +2874,29 @@ mod tests {
     }
 
     #[test]
+    fn bounded_line_reader_discards_oversized_records() -> Result<()> {
+        let data = format!("{}\n{{\"ok\":true}}\n", "x".repeat(128));
+        let mut reader = BufReader::new(std::io::Cursor::new(data.into_bytes()));
+        let mut output = Vec::new();
+        let (bytes, oversized) = read_bounded_line(&mut reader, &mut output, 32)?;
+        assert_eq!(bytes, 129);
+        assert!(oversized);
+        assert!(output.is_empty());
+        let (_, oversized) = read_bounded_line(&mut reader, &mut output, 32)?;
+        assert!(!oversized);
+        assert_eq!(output, b"{\"ok\":true}\n");
+        Ok(())
+    }
+
+    #[test]
+    fn message_text_is_truncated_to_the_requested_granularity() {
+        let (text, truncated) = truncate_message_text(&"内容".repeat(250), 200);
+        assert!(truncated);
+        assert!(text.starts_with(&"内容".repeat(100)));
+        assert!(text.ends_with("已截断）"));
+    }
+
+    #[test]
     fn existing_destination_uses_mv_semantics() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let source = temporary.path().join("source");
@@ -2225,8 +2917,22 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "one");
         assert!(sessions[0].match_excerpt.contains("database"));
-        let preview = migrator.session_preview("one", 3, Some("database"))?;
-        assert_eq!(preview.user_messages, ["repair the sample database"]);
+        let preview = migrator.session_preview("one", 0, 1, 1_000)?;
+        assert_eq!(preview.messages.len(), 1);
+        assert_eq!(preview.messages[0].role, MessageRole::User);
+        assert_eq!(preview.messages[0].content, "repair the sample database");
+        let next = preview.next_offset.expect("there should be another page");
+        let preview = migrator.session_preview("one", next, 1, 1_000)?;
+        assert_eq!(preview.messages.len(), 1);
+        assert_eq!(preview.messages[0].role, MessageRole::Assistant);
+        assert_eq!(
+            preview.messages[0].content,
+            "I can help repair that database."
+        );
+        assert_eq!(
+            preview.messages[0].timestamp.as_deref(),
+            Some("2026-01-02T00:00:01Z")
+        );
         Ok(())
     }
 
@@ -2323,6 +3029,145 @@ mod tests {
     }
 
     #[test]
+    fn archives_and_unarchives_one_session() -> Result<()> {
+        let (_temporary, migrator, session_path) = create_fixture()?;
+        let archive = migrator.plan_session_action("one", SessionAction::Archive)?;
+        let archived_path = archive
+            .rollout_destination
+            .clone()
+            .expect("archive destination");
+        let backup = migrator.apply_session_action(&archive)?;
+        assert!(backup.join("manifest.json").is_file());
+        assert!(!session_path.exists());
+        assert!(archived_path.is_file());
+
+        let archived = migrator.resolve_session("one")?;
+        assert!(archived.archived);
+        assert_eq!(
+            archived.rollout_path.as_deref(),
+            Some(archived_path.as_path())
+        );
+        let state = Connection::open(migrator.codex_home.join("state_5.sqlite"))?;
+        let (flag, archived_at): (i64, Option<i64>) = state.query_row(
+            "SELECT archived, archived_at FROM threads WHERE id='one'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(flag, 1);
+        assert!(archived_at.is_some());
+        drop(state);
+
+        let unarchive = migrator.plan_session_action("one", SessionAction::Unarchive)?;
+        let active_path = unarchive
+            .rollout_destination
+            .clone()
+            .expect("active destination");
+        migrator.apply_session_action(&unarchive)?;
+        assert!(!archived_path.exists());
+        assert!(active_path.is_file());
+        let active = migrator.resolve_session("one")?;
+        assert!(!active.archived);
+        assert_eq!(active.rollout_path.as_deref(), Some(active_path.as_path()));
+        Ok(())
+    }
+
+    #[test]
+    fn deletes_only_the_selected_session_and_keeps_a_backup() -> Result<()> {
+        let (_temporary, migrator, session_path) = create_fixture()?;
+        let plan = migrator.plan_session_action("one", SessionAction::Delete)?;
+        assert!(
+            plan.descriptions()
+                .iter()
+                .any(|line| line.starts_with("delete "))
+        );
+        let backup = migrator.apply_session_action(&plan)?;
+        assert!(backup.join("manifest.json").is_file());
+        assert!(!session_path.exists());
+        assert!(migrator.resolve_session("one").is_err());
+        assert_eq!(migrator.resolve_session("two")?.title, "Other work");
+
+        let index = fs::read_to_string(migrator.codex_home.join("session_index.jsonl"))?;
+        assert!(!index.contains("\"id\":\"one\""));
+        let state = Connection::open(migrator.codex_home.join("state_5.sqlite"))?;
+        let threads: i64 =
+            state.query_row("SELECT count(*) FROM threads WHERE id='one'", [], |row| {
+                row.get(0)
+            })?;
+        let artifacts: i64 = state.query_row(
+            "SELECT count(*) FROM thread_artifacts WHERE thread_id='one'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!((threads, artifacts), (0, 0));
+        let catalog = Connection::open(migrator.codex_home.join("sqlite/codex-dev.db"))?;
+        let catalog_rows: i64 = catalog.query_row(
+            "SELECT count(*) FROM local_thread_catalog WHERE thread_id='one'",
+            [],
+            |row| row.get(0),
+        )?;
+        let run_rows: i64 = catalog.query_row(
+            "SELECT count(*) FROM automation_runs WHERE thread_id='one'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!((catalog_rows, run_rows), (0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn batch_repoints_and_deletes_multiple_sessions() -> Result<()> {
+        let (_temporary, migrator, _session_path) = create_fixture()?;
+        let references = vec!["one".to_owned(), "two".to_owned()];
+        let backups = migrator.apply_session_repoints(&references, "/example/batch-target")?;
+        assert_eq!(backups.len(), 2);
+        assert!(references.iter().all(|id| {
+            migrator
+                .resolve_session(id)
+                .is_ok_and(|session| session.cwd == Path::new("/example/batch-target"))
+        }));
+
+        let plans = references
+            .iter()
+            .map(|id| migrator.plan_session_action(id, SessionAction::Delete))
+            .collect::<Result<Vec<_>>>()?;
+        let backups = migrator.apply_session_actions(&plans)?;
+        assert_eq!(backups.len(), 2);
+        assert!(
+            references
+                .iter()
+                .all(|id| migrator.resolve_session(id).is_err())
+        );
+        let index = fs::read_to_string(migrator.codex_home.join("session_index.jsonl"))?;
+        assert!(index.trim().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_batches_roll_back_completed_sessions() -> Result<()> {
+        let (_temporary, migrator, session_path) = create_fixture()?;
+        let duplicate = vec!["one".to_owned(), "one".to_owned()];
+        assert!(
+            migrator
+                .apply_session_repoints(&duplicate, "/example/batch-target")
+                .is_err()
+        );
+        assert_eq!(
+            migrator.resolve_session("one")?.cwd,
+            Path::new("/example/old-repo")
+        );
+        assert!(session_path.is_file());
+
+        let plans = vec![
+            migrator.plan_session_action("one", SessionAction::Archive)?,
+            migrator.plan_session_action("one", SessionAction::Archive)?,
+        ];
+        assert!(migrator.apply_session_actions(&plans).is_err());
+        assert!(!migrator.resolve_session("one")?.archived);
+        assert!(session_path.is_file());
+        Ok(())
+    }
+
+    #[test]
     fn full_migration_leaves_no_old_path_references() -> Result<()> {
         let (_temporary, migrator, _session_path) = create_fixture()?;
         let plan = migrator.plan("/example/old-repo", "/example/new-repo")?;
@@ -2350,7 +3195,7 @@ mod tests {
         Ok(())
     }
 
-    fn create_opencode_fixture(opencode_home: &Path) -> Result<()> {
+    pub(super) fn create_opencode_fixture(opencode_home: &Path) -> Result<()> {
         fs::create_dir_all(opencode_home)?;
         let database = Connection::open(opencode_home.join("opencode.db"))?;
         database.execute_batch(
@@ -2414,6 +3259,74 @@ mod tests {
             r#"INSERT INTO part VALUES ('p2', 'm2', 's1', 2, '{"type":"text","text":"ok"}')"#,
             [],
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn codex_batch_operations_leave_opencode_data_unchanged() -> Result<()> {
+        let (temporary, migrator, _session_path) = create_fixture()?;
+        let opencode_home = temporary.path().join("share/opencode");
+        create_opencode_fixture(&opencode_home)?;
+        let database_path = opencode_home.join("opencode.db");
+        let original_database = fs::read(&database_path)?;
+        let migrator = migrator.with_opencode(Some(opencode_home))?;
+        let references = vec!["one".to_owned(), "two".to_owned()];
+
+        migrator.apply_session_repoints(&references, "/example/batch-target")?;
+        for action in [
+            SessionAction::Archive,
+            SessionAction::Unarchive,
+            SessionAction::Delete,
+        ] {
+            let plans = references
+                .iter()
+                .map(|id| migrator.plan_session_action(id, action))
+                .collect::<Result<Vec<_>>>()?;
+            migrator.apply_session_actions(&plans)?;
+        }
+
+        assert!(migrator.list_sessions(None)?.is_empty());
+        assert_eq!(fs::read(database_path)?, original_database);
+        assert_eq!(migrator.list_opencode_sessions(None)?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_workspace_backup_restores_both_data_directories() -> Result<()> {
+        let (temporary, migrator, session_path) = create_fixture()?;
+        let opencode_home = temporary.path().join("share/opencode");
+        create_opencode_fixture(&opencode_home)?;
+        let migrator = migrator.with_opencode(Some(opencode_home.clone()))?;
+
+        let plan = migrator.plan("/example/old-repo", "/example/new-repo")?;
+        let backup = migrator.apply(&plan)?.expect("workspace backup");
+        assert_eq!(
+            migrator.resolve_session("one")?.cwd,
+            Path::new("/example/new-repo")
+        );
+        assert_eq!(
+            migrator.resolve_opencode_session("s2")?.cwd,
+            Path::new("/example/new-repo")
+        );
+
+        fs::remove_file(&session_path)?;
+        fs::remove_dir_all(&opencode_home)?;
+        migrator.restore_backup(&backup)?;
+
+        assert!(session_path.is_file());
+        assert_eq!(
+            migrator.resolve_session("one")?.cwd,
+            Path::new("/example/old-repo")
+        );
+        assert_eq!(
+            migrator.resolve_opencode_session("s2")?.cwd,
+            Path::new("/example/old-repo")
+        );
+        let preview = migrator.opencode_session_preview("s1", 6, None)?;
+        assert_eq!(
+            preview.messages[0].content,
+            "please repoint the sample repo"
+        );
         Ok(())
     }
 
@@ -2513,11 +3426,15 @@ mod tests {
         assert_eq!(recursive.len(), 2);
 
         let preview = migrator.opencode_session_preview("s1", 6, None)?;
-        assert_eq!(preview.user_messages, ["please repoint the sample repo"]);
+        assert_eq!(preview.messages.len(), 1);
+        assert_eq!(
+            preview.messages[0].content,
+            "please repoint the sample repo"
+        );
         let preview = migrator.opencode_session_preview("s1", 6, Some("sample"))?;
-        assert_eq!(preview.user_messages.len(), 1);
+        assert_eq!(preview.messages.len(), 1);
         let empty = migrator.opencode_session_preview("s1", 6, Some("nomatch"))?;
-        assert!(empty.user_messages.is_empty());
+        assert!(empty.messages.is_empty());
         Ok(())
     }
 

@@ -4,18 +4,18 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::{Shell, generate};
 use clap_complete_nushell::Nushell;
 use migracoder::{
-    Migrator, SessionInfo, move_workspace, normalize_path, rollback_workspace_move,
-    validate_workspace_move,
+    Migrator, SessionAction, SessionActionPlan, SessionInfo, move_workspace, normalize_path,
+    rollback_workspace_move, validate_workspace_move,
 };
 use std::env;
-use std::io;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "migracoder",
     version,
-    about = "移动工作区时同步更新 Codex 的本地会话指向。"
+    about = "移动工作区时同步更新 Codex 与 opencode 的本地会话指向。"
 )]
 struct Cli {
     #[arg(
@@ -45,7 +45,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    #[command(about = "移动目录，并同步更新 Codex 指向")]
+    #[command(about = "移动目录，并同步更新 Codex 与 opencode 指向")]
     Move {
         #[arg(value_hint = ValueHint::DirPath)]
         old: PathBuf,
@@ -54,7 +54,7 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    #[command(about = "目录已移动，仅修复 Codex 指向")]
+    #[command(about = "目录已移动，仅修复 Codex 与 opencode 指向")]
     Repoint {
         #[arg(value_hint = ValueHint::DirPath)]
         old: PathBuf,
@@ -76,7 +76,21 @@ enum Commands {
         )]
         search: Option<String>,
     },
-    #[command(name = "repoint-session", about = "只修改一个会话的工作目录")]
+    #[command(name = "show-session", about = "分页显示 Codex 会话中的用户与 AI 消息")]
+    ShowSession {
+        session: String,
+        #[arg(long, default_value_t = 0, help = "从上次输出的字节游标继续读取")]
+        offset: u64,
+        #[arg(long, default_value_t = 10, help = "本页最多显示的消息数（1–100）")]
+        limit: usize,
+        #[arg(
+            long,
+            default_value_t = 4_000,
+            help = "每条消息最多显示的字符数（200–50000）"
+        )]
+        max_chars: usize,
+    },
+    #[command(name = "repoint-session", about = "只修改一个 Codex 会话的工作目录")]
     RepointSession {
         session: String,
         #[arg(value_hint = ValueHint::DirPath)]
@@ -91,6 +105,29 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    #[command(name = "archive-session", about = "归档一个 Codex 会话")]
+    ArchiveSession {
+        session: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    #[command(name = "unarchive-session", about = "将一个 Codex 会话移出归档")]
+    UnarchiveSession {
+        session: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    #[command(
+        name = "delete-session",
+        about = "删除一个 Codex 会话（操作前自动备份）"
+    )]
+    DeleteSession {
+        session: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, help = "跳过交互确认")]
+        yes: bool,
+    },
     #[command(about = "生成 Shell 自动补全脚本")]
     Completions {
         #[arg(value_enum)]
@@ -98,7 +135,7 @@ enum Commands {
     },
     #[command(about = "启动图形界面")]
     Gui,
-    #[command(about = "检查 Codex 数据目录及可识别的数据")]
+    #[command(about = "检查 Codex 与 opencode 数据目录及可识别的数据")]
     Doctor,
     #[command(about = "确认旧路径的 Codex 指向是否已经清除")]
     Verify {
@@ -158,6 +195,56 @@ fn run() -> Result<()> {
             };
             print_sessions(path.as_deref(), &sessions);
         }
+        Commands::ShowSession {
+            session,
+            offset,
+            limit,
+            max_chars,
+        } => {
+            let preview = migrator.session_preview(&session, offset, limit, max_chars)?;
+            println!(
+                "会话：{}  {}",
+                preview.session.session_id, preview.session.title
+            );
+            println!("工作目录：{}", preview.session.cwd.display());
+            for (index, message) in preview.messages.iter().enumerate() {
+                let truncated = if message.truncated {
+                    "（已截断）"
+                } else {
+                    ""
+                };
+                println!(
+                    "\n[{}] {}{}\n{}",
+                    index + 1,
+                    message.role.label(),
+                    truncated,
+                    safe_terminal_text(&message.content)
+                );
+            }
+            if preview.messages.is_empty() {
+                println!("本页没有可显示的用户或 AI 消息");
+            }
+            if preview.skipped_oversized_records > 0 {
+                println!(
+                    "警告：为控制内存，已跳过 {} 条超过 8 MiB 的 JSONL 记录",
+                    preview.skipped_oversized_records
+                );
+            }
+            if let Some(next) = preview.next_offset {
+                println!(
+                    "\n下一页：{}",
+                    next_page_command(
+                        &migrator,
+                        &preview.session.session_id,
+                        next,
+                        limit,
+                        max_chars
+                    )
+                );
+            } else {
+                println!("\n已到会话末尾");
+            }
+        }
         Commands::RepointSession {
             session,
             new,
@@ -207,6 +294,30 @@ fn run() -> Result<()> {
                 Some(backup) => println!("标题已更新；备份：{}", backup.display()),
                 None => println!("该会话没有需要更新的标题数据"),
             }
+        }
+        Commands::ArchiveSession { session, dry_run } => {
+            run_session_action(&migrator, &session, SessionAction::Archive, dry_run)?;
+        }
+        Commands::UnarchiveSession { session, dry_run } => {
+            run_session_action(&migrator, &session, SessionAction::Unarchive, dry_run)?;
+        }
+        Commands::DeleteSession {
+            session,
+            dry_run,
+            yes,
+        } => {
+            let plan = migrator.plan_session_action(&session, SessionAction::Delete)?;
+            print_session_action_plan(&plan);
+            if dry_run {
+                println!("dry-run：未修改任何内容");
+                return Ok(());
+            }
+            if !yes && !confirm_session_delete(&plan)? {
+                println!("已取消，未修改任何内容");
+                return Ok(());
+            }
+            let backup = migrator.apply_session_action(&plan)?;
+            println!("会话已删除；恢复备份：{}", backup.display());
         }
         Commands::Repoint { old, new, dry_run } => {
             let new = normalize_path(new)?;
@@ -283,6 +394,49 @@ fn run() -> Result<()> {
         Commands::Gui => unreachable!("handled before Codex initialization"),
     }
     Ok(())
+}
+
+fn run_session_action(
+    migrator: &Migrator,
+    reference: &str,
+    action: SessionAction,
+    dry_run: bool,
+) -> Result<()> {
+    let plan = migrator.plan_session_action(reference, action)?;
+    print_session_action_plan(&plan);
+    if dry_run {
+        println!("dry-run：未修改任何内容");
+        return Ok(());
+    }
+    let backup = migrator.apply_session_action(&plan)?;
+    println!("会话已{}；恢复备份：{}", action.label(), backup.display());
+    Ok(())
+}
+
+fn print_session_action_plan(plan: &SessionActionPlan) {
+    println!("会话：{}  {}", plan.session.session_id, plan.session.title);
+    println!("操作：{}", plan.action.label());
+    for description in plan.descriptions() {
+        println!("  {description}");
+    }
+    println!("共涉及 {} 个文件", plan.files());
+}
+
+fn confirm_session_delete(plan: &SessionActionPlan) -> Result<bool> {
+    if !io::stdin().is_terminal() {
+        bail!("非交互环境删除会话时必须传入 --yes");
+    }
+    print!(
+        "确认永久删除会话“{}”（{}）？[y/N] ",
+        plan.session.title, plan.session.session_id
+    );
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 fn generate_completions(shell: CompletionShell) {
@@ -370,4 +524,32 @@ fn print_sessions(path: Option<&Path>, sessions: &[SessionInfo]) {
             println!("    命中：{}", session.match_excerpt);
         }
     }
+}
+
+fn safe_terminal_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| matches!(character, '\n' | '\r' | '\t') || !character.is_control())
+        .collect()
+}
+
+fn next_page_command(
+    migrator: &Migrator,
+    session_id: &str,
+    offset: u64,
+    limit: usize,
+    max_chars: usize,
+) -> String {
+    let opencode_option = match &migrator.opencode_home {
+        Some(home) => format!("--opencode-home {}", shell_quote(&home.to_string_lossy())),
+        None => "--no-opencode".to_owned(),
+    };
+    format!(
+        "migracoder --codex-home {} {opencode_option} show-session {} --offset {offset} --limit {limit} --max-chars {max_chars}",
+        shell_quote(&migrator.codex_home.to_string_lossy()),
+        shell_quote(session_id),
+    )
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
